@@ -461,8 +461,8 @@ def build_status(session_quality: list[dict], observations: list[dict], as_of: d
     }
 
 
-def evaluate_archive(archive: Path = ARCHIVE, output_dir: Path = EVALUATION_DIR, write: bool = True) -> tuple[dict, list[dict]]:
-    sector_map = json.loads(SECTOR_MAP_PATH.read_text())
+def evaluate_archive(archive: Path = ARCHIVE, output_dir: Path = EVALUATION_DIR, write: bool = True, sector_map_path: Path = SECTOR_MAP_PATH) -> tuple[dict, list[dict]]:
+    sector_map = json.loads(sector_map_path.read_text())
     volume_history: dict[str, list[float]] = defaultdict(list)
     observations = []
     session_quality = []

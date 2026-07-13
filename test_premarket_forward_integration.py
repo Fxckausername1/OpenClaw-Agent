@@ -41,6 +41,8 @@ class EndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "archive"
             output = Path(directory) / "evaluation"
+            sector_map = Path(directory) / "sector_map.json"
+            sector_map.write_text('{"AAPL":"XLK"}')
             session = archive / "2026-07-14"
             symbols = ["AAPL", "SPY", "XLK"]
             capture = []
@@ -77,7 +79,7 @@ class EndToEndTests(unittest.TestCase):
                 "symbols": symbols,
             })
 
-            status, observations = evaluate_archive(archive, output, write=True)
+            status, observations = evaluate_archive(archive, output, write=True, sector_map_path=sector_map)
             self.assertEqual(status["sealed_scored_market_days"], 1)
             self.assertEqual(status["data_quality"]["quote_coverage"], 1.0)
             self.assertEqual(status["candidates"]["orb_forward_baseline"]["observations"], 1)
