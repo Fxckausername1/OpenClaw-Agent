@@ -39,7 +39,7 @@ class TimeContractTests(unittest.TestCase):
             validate_schedule("sip-backfill", day, datetime(2026, 7, 13, 9, 50, tzinfo=ET), False)
 
     def test_forward_gate_is_fixed_before_capture(self):
-        self.assertEqual(PROTOCOL_VERSION, "premarket-forward-2026-07-13.2")
+        self.assertEqual(PROTOCOL_VERSION, "premarket-forward-2026-07-13.4")
         self.assertEqual(FORWARD_GATE["minimum_sealed_market_days"], 120)
         self.assertEqual(FORWARD_GATE["minimum_eligible_observations"], 250)
         self.assertEqual(FORWARD_GATE["minimum_quote_coverage"], 0.90)

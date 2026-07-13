@@ -1,6 +1,6 @@
 # Sealed Premarket Forward Protocol
 
-Version: `premarket-forward-2026-07-13.2`
+Version: `premarket-forward-2026-07-13.4`
 
 ## Purpose
 
@@ -31,13 +31,17 @@ Official references:
 
 ## Two-stage collection
 
-### 1. Pre-open IEX capture
+### 1. Pre-open IEX plus delayed-SIP capture
 
 - Target: 09:15 ET on weekdays.
-- Window: 04:00 ET through the latest completed minute.
-- Data: one-minute IEX bars plus current IEX snapshots, including quote/trade and prior
-  daily-bar fields when the provider supplies them.
-- Role: sealed point-in-time forward evidence. This file is available before the open.
+- IEX window: 04:00 ET through the latest completed minute.
+- SIP window: 04:00 ET through 16 minutes before capture, safely beyond the account's
+  15-minute historical-SIP restriction.
+- Data: live IEX bars/snapshots, delayed-SIP snapshots, and delayed historical SIP bars.
+  SIP supplies consolidated VWAP, volume, range, and quote coverage; IEX supplies the
+  latest decision-time trade context.
+- SPY and the 11 sector ETFs are always included as reference instruments.
+- Role: sealed point-in-time forward evidence available before the open.
 
 The wrapper accepts execution only from 09:10 through 09:19 ET. Cron contains both UTC
 DST possibilities, and the ET gate ensures only the correct one can run.
@@ -45,9 +49,11 @@ DST possibilities, and the ET gate ensures only the correct one can run.
 ### 2. Post-close SIP backfill
 
 - Target: 16:30 ET on weekdays.
-- Window: 04:00-09:29:59 ET plus trailing SIP daily bars for prior-close reconstruction.
+- Window: 04:00-15:59:59 ET plus trailing SIP daily bars for prior-close reconstruction.
+- Data roles: premarket feature audit plus regular-session outcome scoring after the close.
 - Role: comprehensive research/audit data. It is explicitly marked unavailable for the
-  pre-open decision and cannot replace or modify the IEX capture.
+  pre-open decision and cannot replace or modify the IEX capture. Regular-session bars
+  are outcomes, never inputs to the same day's pre-open features.
 
 Post-close timing prevents the heavier SIP download from competing with live scanners.
 
@@ -88,6 +94,10 @@ requires all of them:
 - quote coverage of at least 90%;
 - missing rate no greater than 10% for every required feature;
 - a genuinely future sample disjoint from the historical discovery data.
+
+The July 13 protocol-v3 IEX-only capture is retained as immutable initialization evidence.
+Its quality audit found premarket bars for only 32 of 180 stocks and it is excluded from
+the homogeneous scored sample. Protocol v4 begins the scored sample on July 14.
 
 No live rule may be derived from an unsealed same-day file. Historical discovery remains
 separate from future forward evaluation. Failure of any gate rejects live promotion.

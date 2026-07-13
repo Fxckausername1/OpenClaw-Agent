@@ -25,7 +25,7 @@ PROTOCOL_PATH = ROOT / "PREMARKET_FORWARD_PROTOCOL.md"
 BASE_URL = "https://data.alpaca.markets/v2/stocks"
 ET = ZoneInfo("America/New_York")
 UTC = timezone.utc
-PROTOCOL_VERSION = "premarket-forward-2026-07-13.2"
+PROTOCOL_VERSION = "premarket-forward-2026-07-13.4"
 FORWARD_GATE = {
     "minimum_sealed_market_days": 120,
     "minimum_eligible_observations": 250,
@@ -36,6 +36,7 @@ FORWARD_GATE = {
     "maximum_required_field_missing_rate": 0.10,
     "requires_disjoint_future_sample": True,
 }
+REFERENCE_SYMBOLS = ("SPY", "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY")
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -57,7 +58,7 @@ def load_universe(path: Path = UNIVERSE_PATH) -> tuple[list[str], dict]:
     source = raw.get("symbols", raw) if isinstance(raw, dict) else raw
     if not isinstance(source, list):
         raise ValueError("universe must be a list or object with a symbols list")
-    symbols = sorted({str(symbol).strip().upper() for symbol in source if str(symbol).strip()})
+    symbols = sorted({str(symbol).strip().upper() for symbol in source if str(symbol).strip()} | set(REFERENCE_SYMBOLS))
     if not symbols:
         raise ValueError("universe is empty")
     metadata = raw if isinstance(raw, dict) else {"source": str(path)}
@@ -241,11 +242,20 @@ def collect(mode: str, session_date: date, symbols: list[str], universe_meta: di
         snapshots, ids = fetch_snapshots(session, headers, symbols, feed)
         records.extend(snapshots)
         request_ids.extend(ids)
+        delayed_snapshots, ids = fetch_snapshots(session, headers, symbols, "delayed_sip")
+        records.extend(delayed_snapshots)
+        request_ids.extend(ids)
+        delayed_sip_end = min(now.replace(second=0, microsecond=0) - timedelta(minutes=16), market_open - timedelta(microseconds=1))
+        delayed_sip, ids = fetch_bars(session, headers, symbols, "sip", "1Min", start, delayed_sip_end)
+        records.extend(delayed_sip)
+        request_ids.extend(ids)
+        feed = "iex+delayed_sip"
         stem = "iex_capture_0915"
         decision_available_preopen = True
     elif mode == "sip-backfill":
         feed = "sip"
-        end = market_open - timedelta(microseconds=1)
+        session_close = datetime.combine(session_date, clock(16, 0), tzinfo=ET)
+        end = session_close - timedelta(microseconds=1)
         records, ids = fetch_bars(session, headers, symbols, feed, "1Min", start, end)
         request_ids.extend(ids)
         daily_start = datetime.combine(session_date - timedelta(days=10), clock(0, 0), tzinfo=ET)
@@ -253,7 +263,7 @@ def collect(mode: str, session_date: date, symbols: list[str], universe_meta: di
         daily, ids = fetch_bars(session, headers, symbols, feed, "1Day", daily_start, daily_end)
         records.extend(daily)
         request_ids.extend(ids)
-        stem = "sip_backfill_0930"
+        stem = "sip_session_backfill_1600"
         decision_available_preopen = False
     else:
         raise ValueError(mode)
@@ -271,11 +281,15 @@ def collect(mode: str, session_date: date, symbols: list[str], universe_meta: di
         "protocol_version": PROTOCOL_VERSION,
         "mode": mode,
         "feed": feed,
+        "feeds": ["iex", "delayed_sip", "sip"] if mode == "capture" else ["sip"],
         "session_date": session_date.isoformat(),
         "collected_at": collected_at,
         "requested_start": iso_utc(start),
         "requested_end": iso_utc(end),
+        "delayed_sip_end": iso_utc(delayed_sip_end) if mode == "capture" else None,
         "decision_available_preopen": decision_available_preopen,
+        "regular_session_included": mode == "sip-backfill",
+        "outcome_available_postclose": mode == "sip-backfill",
         "forward_gate": FORWARD_GATE,
         "universe_source": universe_meta.get("source", str(UNIVERSE_PATH)),
         "universe_built_at": universe_meta.get("built_at"),
@@ -289,9 +303,9 @@ def collect(mode: str, session_date: date, symbols: list[str], universe_meta: di
         "daily_bar_records": sum(record["record_type"] == "daily_bar" for record in records),
         "snapshot_records": sum(record["record_type"] == "snapshot" for record in records),
         "notes": (
-            "IEX data was captured before the regular open and is eligible for sealed forward feature construction."
+            "IEX snapshots/latest bars plus delayed-SIP snapshots and 16-minute-delayed SIP premarket bars were sealed before the open for forward feature construction."
             if mode == "capture"
-            else "SIP data was collected after the session and is audit/research data only; it cannot rewrite the pre-open capture."
+            else "SIP premarket and regular-session data was collected after the close for outcome scoring and audit; it cannot rewrite the pre-open capture."
         ),
     }
     if dry_run:
