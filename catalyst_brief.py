@@ -42,6 +42,8 @@ from reportlab.platypus import (
 )
 from xml.sax.saxutils import escape
 
+from manual_options_brief import build_manual_options_layer
+
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -71,6 +73,8 @@ SOURCE_METHODS = {
     "macro_news": "Finnhub and Yahoo Finance discovery plus official Federal Reserve RSS",
     "cross_asset": "Alpaca IEX bars for rates, dollar, oil, breadth, and semiconductor proxies",
     "prior_brief": "Prior immutable Catalyst Brief and fixed post-close score",
+    "technical_context": "Alpaca live IEX regular-session bars, delayed consolidated SIP premarket bars, and prior-session daily bars; deterministic EMA/SMA and sweep/reclaim proxy",
+    "option_chain": "Alpaca free indicative option chain plus T-1 contract open interest; research snapshot, not executable NBBO",
 }
 
 
@@ -162,7 +166,7 @@ def session_dt(day: date, hh: int, mm: int) -> datetime:
 
 
 def fetch_session_bars(day: date, end_et: datetime) -> tuple[dict[str, list[dict[str, Any]]], str]:
-    start = session_dt(day, 9, 30)
+    start = session_dt(day, 4, 0)
     params = {
         "symbols": "SPY,QQQ",
         "timeframe": "1Min",
@@ -951,9 +955,48 @@ def build_packet(day: date, preview: bool = False, fixture: bool = False) -> dic
     )
     daily_read = build_daily_read(label, spy, qqq, changes, macro_context, xlks)
 
+    manual_options = build_manual_options_layer(
+        ROOT, day, observed, indices, bars_raw, quality, fixture=fixture
+    )
+    technical_fresh = manual_options.get("technical_quality") == "FRESH"
+    option_quality = manual_options.get("option_quote_quality")
+    sources.append(source_record(
+        "S10", "technical_context",
+        f"{ALPACA_DATA_URL}?{urlencode({'symbols':'SPY,QQQ','timeframe':'1Min,1Day','feed':'iex'})}",
+        manual_options.get("as_of"), iso(observed), technical_fresh,
+        "EMA9/20 uses completed live IEX 1m bars. SMA20/50/200 uses prior completed daily sessions. "
+        "Premarket levels use completed consolidated SIP history with a 10-bar coverage gate. "
+        "Sweep/reclaim is a fixed bar-based proxy around prior-day, premarket, and opening-range levels.",
+    ))
+    sources.append(source_record(
+        "S11", "option_chain",
+        "https://data.alpaca.markets/v1beta1/options/snapshots/{SPY|QQQ}",
+        manual_options.get("as_of"), iso(observed), option_quality == "AVAILABLE - INDICATIVE",
+        "Free indicative quotes may differ from executable NBBO. Candidate expires as a research snapshot "
+        "and must be checked at the broker immediately before a manual order.",
+    ))
+    for ticker in ("SPY", "QQQ"):
+        card = (manual_options.get("cards") or {}).get(ticker) or {}
+        technical = card.get("technical") or {}
+        latest_sweep = technical.get("latest_sweep")
+        sweep_text = (
+            f"{latest_sweep.get('direction')} {latest_sweep.get('level_name')} "
+            f"at {money(latest_sweep.get('level'))}"
+            if latest_sweep else "no confirmed sweep/reclaim proxy"
+        )
+        direction = technical.get("base_direction", "unavailable")
+        evidence_rows.append(evidence(
+            f"E{len(evidence_rows)+1}",
+            "supports" if direction in ("bullish", "bearish") else "pushes_back",
+            f"{ticker}/MANUAL",
+            f"Underlying vote {direction}: {technical.get('bullish_votes', 0)} bullish, "
+            f"{technical.get('bearish_votes', 0)} bearish; {sweep_text}.",
+            "Adds moving-average and defined sweep/reclaim confluence to the manual options watch only.",
+            ["S3", "S10"],
+        ))
 
     return {
-        "schema_version": "catalyst-brief-2.0",
+        "schema_version": "catalyst-brief-3.0",
         "report_id": f"CB-{day.isoformat()}{'-PREVIEW' if preview else ''}",
         "session_date": day.isoformat(),
         "edition": "PREVIEW - AFTER-CLOSE INPUTS" if preview else "09:55 ET SESSION PLAYBOOK",
@@ -978,6 +1021,7 @@ def build_packet(day: date, preview: bool = False, fixture: bool = False) -> dic
         "macro_context": macro_context,
         "cross_assets": cross_assets,
         "technology_context": xlks,
+        "manual_options": manual_options,
         "optional_focus": focus,
         "calendar": calendar,
         "scenarios": build_scenarios(label, spy, qqq),
@@ -1028,6 +1072,8 @@ def report_styles() -> dict[str, ParagraphStyle]:
                                      leading=14, textColor=WHITE, spaceAfter=4),
         "center": ParagraphStyle("Center", parent=base["BodyText"], fontName="Helvetica-Bold", fontSize=8,
                                  leading=10, textColor=INK, alignment=TA_CENTER),
+        "center_white": ParagraphStyle("CenterWhite", parent=base["BodyText"], fontName="Helvetica-Bold", fontSize=8,
+                                       leading=10, textColor=WHITE, alignment=TA_CENTER),
     }
 
 
@@ -1131,6 +1177,141 @@ def render_pdf(packet: dict[str, Any], out_path: Path) -> None:
                                ("LEFTPADDING", (0, 0), (-1, -1), 0),
                                ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
     story += [cards, Spacer(1, 9)]
+
+    manual = packet.get("manual_options")
+    if manual:
+        story += [PageBreak(), Paragraph("MANUAL SPY/QQQ OPTIONS DECISION CARD", styles["h1"])]
+        story.append(Paragraph(
+            "<b>Separate from the bot.</b> This section is for discretionary SPY/QQQ options research. "
+            "It cannot alter MR/ORB, place an order, or treat news, moving averages, or a sweep proxy as "
+            "a standalone entry. Both indices must align before a call or put watch is shown.",
+            styles["body"],
+        ))
+        premium_band = manual.get("premium_band") or [None, None]
+        summary = Table([
+            [Paragraph("MARKET STATE", styles["center_white"]),
+             Paragraph("BUDGET / PREMIUM", styles["center_white"]),
+             Paragraph("TARGET", styles["center_white"]),
+             Paragraph("DATA", styles["center_white"])],
+            [Paragraph(ptext(manual.get("market_state")), styles["body"]),
+             Paragraph(f"${ptext(manual.get('budget'))} / "
+                       f"${ptext(premium_band[0])}-${ptext(premium_band[1])}", styles["body"]),
+             Paragraph(f"{ptext(manual.get('target_return_pct'))}% (rounded up to a whole cent)", styles["body"]),
+             Paragraph(f"TECH {ptext(manual.get('technical_quality'))}<br/>"
+                       f"PM {ptext(manual.get('premarket_quality'))}<br/>"
+                       f"OPTIONS {ptext(manual.get('option_quote_quality'))}", styles["body"])],
+        ], colWidths=[1.85 * inch, 1.75 * inch, 1.7 * inch, 1.6 * inch])
+        summary.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), INK), ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#CBD5DC")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8E0E5")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story += [summary, Spacer(1, 8)]
+
+        for ticker in ("SPY", "QQQ"):
+            card = (manual.get("cards") or {}).get(ticker) or {}
+            technical = card.get("technical") or {}
+            candidate = card.get("candidate")
+            vote_text = ", ".join(
+                f"{vote.get('signal')}: {vote.get('direction')}"
+                for vote in technical.get("votes") or []
+            )
+            sweep = technical.get("latest_sweep")
+            sweep_text = (
+                f"{ptext(sweep.get('direction')).upper()} {ptext(sweep.get('level_name'))} "
+                f"{money(sweep.get('level'))}; swept {ptext(sweep.get('swept_at'))}, "
+                f"confirmed {ptext(sweep.get('confirmed_at'))}"
+                if sweep else "None confirmed under the penetration + reclaim + next-bar-hold rule."
+            )
+            rows = [
+                [Paragraph(f"{ptext(ticker)} / {ptext(card.get('state'))}", styles["center_white"]), ""],
+                [Paragraph("Underlying votes", styles["small"]),
+                 Paragraph(ptext(vote_text), styles["body"])],
+                [Paragraph("Moving averages", styles["small"]),
+                 Paragraph(
+                     f"1m EMA9 {money(technical.get('ema9_1m'))}; EMA20 {money(technical.get('ema20_1m'))}. "
+                     f"Prior-session SMA20 {money(technical.get('sma20_prior'))}; "
+                     f"SMA50 {money(technical.get('sma50_prior'))}; SMA200 {money(technical.get('sma200_prior'))}.",
+                     styles["body"],
+                 )],
+                [Paragraph("Reference levels", styles["small"]),
+                 Paragraph(
+                     f"Prior H/L {money(technical.get('prior_day_high'))}/{money(technical.get('prior_day_low'))}; "
+                     f"premarket H/L {money(technical.get('premarket_high'))}/{money(technical.get('premarket_low'))} "
+                     f"({ptext(technical.get('premarket_quality'))}); opening-range H/L "
+                     f"{money(technical.get('opening_range_high'))}/{money(technical.get('opening_range_low'))}.",
+                     styles["body"],
+                 )],
+                [Paragraph("Liquidity sweep proxy", styles["small"]),
+                 Paragraph(sweep_text, styles["body"])],
+                [Paragraph("Activation / invalidation", styles["small"]),
+                 Paragraph(
+                     f"Call watch above {money(technical.get('call_activation'))}; "
+                     f"put watch below {money(technical.get('put_activation'))}. "
+                     f"Current thesis invalidation: {ptext(technical.get('invalidation'))}.",
+                     styles["body"],
+                 )],
+            ]
+            if candidate:
+                reasons = "; ".join(candidate.get("reject_reasons") or ["none under the fixed research screen"])
+                rows.extend([
+                    [Paragraph("Contract snapshot", styles["small"]),
+                     Paragraph(
+                         f"<b>{ptext(candidate.get('contract'))}</b> | "
+                         f"{ptext(candidate.get('type')).upper()} {money(candidate.get('strike'))} | "
+                         f"bid/ask {money(candidate.get('bid'))}/{money(candidate.get('ask'))} | "
+                         f"spread {money(candidate.get('spread'))} ({ptext(candidate.get('spread_pct'))}%) | "
+                         f"delta {ptext(candidate.get('delta'))} | theta/day {ptext(candidate.get('theta_per_day'))} | "
+                         f"T-1 OI {ptext(candidate.get('open_interest_t1'))} | "
+                         f"quote {ptext(candidate.get('quote_timestamp'))}.",
+                         styles["body"],
+                     )],
+                    [Paragraph("$400 / +25% math", styles["small"]),
+                     Paragraph(
+                         f"{ptext(candidate.get('contracts'))} contracts = "
+                         f"${ptext(candidate.get('estimated_debit'))}; target "
+                         f"{money(candidate.get('target_premium'))}; gross target "
+                         f"${ptext(candidate.get('gross_target_profit'))}. Estimated full-spread cost "
+                         f"${ptext(candidate.get('estimated_full_spread_cost'))} = "
+                         f"{ptext(candidate.get('friction_ratio_pct'))}% of gross target. "
+                         f"Constant-IV model requires underlying move "
+                         f"{ptext(candidate.get('estimated_required_underlying_move_pct'))}%.",
+                         styles["body"],
+                     )],
+                    [Paragraph("Screen", styles["small"]),
+                     Paragraph(
+                         f"<b>{ptext(candidate.get('screen'))}</b>. Reasons: {ptext(reasons)}. "
+                         "Indicative feed is not executable NBBO; verify the live broker quote immediately before entry.",
+                         styles["body"],
+                     )],
+                ])
+            else:
+                rows.append([
+                    Paragraph("Contract snapshot", styles["small"]),
+                    Paragraph(ptext(card.get("candidate_note")), styles["body"]),
+                ])
+            table = Table(rows, colWidths=[1.3 * inch, 5.6 * inch])
+            table.setStyle(TableStyle([
+                ("SPAN", (0, 0), (1, 0)),
+                ("BACKGROUND", (0, 0), (1, 0), PANEL),
+                ("TEXTCOLOR", (0, 0), (1, 0), WHITE),
+                ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#CBD5DC")),
+                ("INNERGRID", (0, 1), (-1, -1), 0.25, colors.HexColor("#D8E0E5")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story += [KeepTogether(table), Spacer(1, 8)]
+
+        story.append(Paragraph(
+            "<b>Risk boundary.</b> The report assumes no stop-loss rule and therefore does not claim positive "
+            "expectancy. Cheap premium is not an edge. The displayed required move holds IV constant and becomes "
+            "less reliable as expiration approaches. [S10, S11]",
+            styles["small"],
+        ))
 
     story += [PageBreak(), Paragraph("EVIDENCE BALANCE", styles["h1"])]
     ev_rows = [[Paragraph("SIDE", styles["center"]), Paragraph("OBSERVED DATA", styles["center"]),

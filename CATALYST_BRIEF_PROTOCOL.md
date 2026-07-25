@@ -46,6 +46,41 @@ Macro discovery uses Finnhub general-market news, Yahoo Finance news search, and
 
 The PDF header reports core-data and macro-data quality separately. A fresh BLS file does not imply complete macro coverage.
 
+## Manual SPY/QQQ options decision layer (schema v3)
+
+This layer is for Heff's discretionary options trading only. It is isolated from MR,
+ORB, scanners, executors, strategy settings, and order placement.
+
+For SPY and QQQ it records:
+
+- completed 1-minute EMA 9/20 alignment and position versus VWAP;
+- prior-session SMA 20/50/200 context;
+- prior-day, premarket, and opening-range reference levels; premarket levels use
+  the completed consolidated SIP window and require at least 10 one-minute bars;
+- a strict liquidity-sweep proxy: a low may only produce a bullish sell-side sweep
+  after penetration, reclaim close, and next-bar hold; a high may only produce a
+  bearish buy-side sweep after penetration, rejection close, and next-bar hold;
+- five fixed underlying votes and mandatory SPY/QQQ directional alignment;
+- exact call-watch, put-watch, and invalidation levels.
+
+A contract is surfaced only when both indices align and core data is fresh. The
+research screen uses the user's fixed $400 budget, $0.20-$0.30 ask band, and +25%
+premium target rounded up to the next whole cent. It reports contract count, debit,
+spread, spread as a percentage of midpoint, T-1 open interest, Greeks, estimated
+full-spread cost as a share of gross target, and a constant-IV estimate of the
+underlying move required to reach the target.
+
+The initial contract screen is observation-only and rejects quotes older than 120
+seconds, spreads over $0.02 or 10% of midpoint, absolute delta below 0.10, or estimated
+full-spread friction over 35% of gross target. These are fixed research filters, not
+validated edge. Alpaca's free option feed is indicative rather than executable NBBO,
+so every surfaced candidate says `VERIFY LIVE`; the live broker quote remains the
+only acceptable execution reference.
+
+News and macro remain in the report. They provide mechanism and event-risk context,
+but they cannot create a call/put watch or override price, GEX, SPY/QQQ alignment, or
+contract-quality rejection.
+
 ## Outputs
 
 Official immutable archives live under:
@@ -62,7 +97,7 @@ The publisher copies only report artifacts to the private `trading-dashboard-sna
 cd /home/heff/.openclaw/workspace
 ./venv/bin/python catalyst_brief.py --mode preview
 ./venv/bin/python catalyst_brief.py --mode verify
-./venv/bin/python -m unittest -v test_catalyst_brief.py test_official_calendar_pull.py
+./venv/bin/python -m unittest -v test_catalyst_brief.py test_macro_news_pull.py test_official_calendar_pull.py test_manual_options_brief.py
 ./venv/bin/python scripts/install_catalyst_brief_cron.py
 ```
 
