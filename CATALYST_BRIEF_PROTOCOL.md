@@ -30,7 +30,21 @@ Missing or stale required evidence lowers the brief to `INSUFFICIENT EVIDENCE`; 
 - SPY and QQQ disagree: cross-index divergence / selective.
 - Required evidence unavailable: stand aside.
 
-The report contains one answerable thesis question, a trigger and constraint, an executive conclusion, a narrative hinge, supporting and opposing evidence, a known-calendar section, three fixed scenario paths, and a source/freshness appendix.
+The report contains one answerable thesis question, a trigger and constraint, an executive conclusion, a narrative hinge, supporting and opposing evidence, a known-calendar section, three daily scenario paths, and a source/freshness appendix.
+
+## Meaningfulness standard (schema v2)
+
+A repeated regime label is not allowed to stand alone. Every report compares itself with the prior immutable brief and records:
+
+- monthly and 0DTE GEX magnitude changes;
+- opening-range location and width changes;
+- the prior session's fixed post-close score;
+- today's early leader and the index withholding confirmation;
+- ranked macro headlines with publication time, source URL, market mechanism, and an observed cross-asset check.
+
+Macro discovery uses Finnhub general-market news, Yahoo Finance news search, and official Federal Reserve monetary-policy/speech RSS. The macro pull runs at 08:36 and again immediately before the 09:52 build. News is secondary context and cannot override price/GEX. A headline is explicitly marked confirmed, unconfirmed, or contradicted using TLT, UUP, USO, IWM, SOXX, SPY, and QQQ opening-session moves.
+
+The PDF header reports core-data and macro-data quality separately. A fresh BLS file does not imply complete macro coverage.
 
 ## Outputs
 
