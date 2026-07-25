@@ -57,8 +57,10 @@ MONTHLY_GEX_MAX_MIN = 45
 ZERO_DTE_GEX_MAX_MIN = 6
 CATALYST_MAX_HOURS = 30
 CALENDAR_MAX_HOURS = 12
+MACRO_NEWS_MAX_MIN = 180
 
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/bars"
+CROSS_ASSETS = ("TLT", "UUP", "USO", "IWM", "SOXX", "SPY", "QQQ")
 SOURCE_METHODS = {
     "monthly_gex": "Alpaca options chain -> bot GEX engine, approximately 30 DTE",
     "zero_dte_gex": "Alpaca same-day options chain -> bot GEX engine",
@@ -66,6 +68,9 @@ SOURCE_METHODS = {
     "sector_rotation": "Alpaca daily bars; sector ETF / SPY relative rotation",
     "catalyst": "SEC EDGAR 8-K and openFDA primary-source event archive",
     "calendar": "U.S. BLS official release calendar (ICS); coverage intentionally disclosed",
+    "macro_news": "Finnhub and Yahoo Finance discovery plus official Federal Reserve RSS",
+    "cross_asset": "Alpaca IEX bars for rates, dollar, oil, breadth, and semiconductor proxies",
+    "prior_brief": "Prior immutable Catalyst Brief and fixed post-close score",
 }
 
 
@@ -172,6 +177,59 @@ def fetch_session_bars(day: date, end_et: datetime) -> tuple[dict[str, list[dict
     response.raise_for_status()
     payload = response.json()
     return payload.get("bars") or {}, response.headers.get("X-Request-ID", "")
+
+
+def fetch_cross_asset_snapshot(day: date, end_et: datetime) -> tuple[dict[str, dict[str, Any]], str]:
+    """Return previous-close and opening-session moves for macro confirmation ETFs."""
+    symbols = ",".join(CROSS_ASSETS)
+    daily_params = {
+        "symbols": symbols,
+        "timeframe": "1Day",
+        "start": datetime.combine(day - timedelta(days=10), time(), ET).astimezone(UTC).isoformat(),
+        "end": datetime.combine(day, time(), ET).astimezone(UTC).isoformat(),
+        "feed": "iex",
+        "adjustment": "raw",
+        "limit": 1000,
+        "sort": "asc",
+    }
+    minute_params = {
+        "symbols": symbols,
+        "timeframe": "1Min",
+        "start": session_dt(day, 9, 30).astimezone(UTC).isoformat(),
+        "end": end_et.astimezone(UTC).isoformat(),
+        "feed": "iex",
+        "adjustment": "raw",
+        "limit": 10000,
+        "sort": "asc",
+    }
+    daily_response = requests.get(ALPACA_DATA_URL, headers=alpaca_headers(), params=daily_params, timeout=25)
+    daily_response.raise_for_status()
+    minute_response = requests.get(ALPACA_DATA_URL, headers=alpaca_headers(), params=minute_params, timeout=25)
+    minute_response.raise_for_status()
+    daily = daily_response.json().get("bars") or {}
+    minute = minute_response.json().get("bars") or {}
+    out = {}
+    for symbol in CROSS_ASSETS:
+        prior_rows = daily.get(symbol) or []
+        today_rows = minute.get(symbol) or []
+        previous_close = num(prior_rows[-1].get("c")) if prior_rows else None
+        open_price = num(today_rows[0].get("o")) if today_rows else None
+        last = num(today_rows[-1].get("c")) if today_rows else None
+        change_pct = ((last / previous_close) - 1) * 100 if last and previous_close else None
+        session_move_pct = ((last / open_price) - 1) * 100 if last and open_price else None
+        out[symbol] = {
+            "previous_close": previous_close,
+            "open": open_price,
+            "last": last,
+            "change_pct": round(change_pct, 3) if change_pct is not None else None,
+            "session_move_pct": round(session_move_pct, 3) if session_move_pct is not None else None,
+            "bars": len(today_rows),
+        }
+    request_ids = ",".join(filter(None, (
+        daily_response.headers.get("X-Request-ID", ""),
+        minute_response.headers.get("X-Request-ID", ""),
+    )))
+    return out, request_ids
 
 
 def fixture_bars(day: date) -> dict[str, list[dict[str, Any]]]:
@@ -364,6 +422,146 @@ def optional_focus(day: date, now: datetime) -> tuple[dict[str, Any] | None, dic
     }, {"path": catalyst_path, "state": state, "premarket_path": pm_path}
 
 
+def macro_confirmation(topic: str, cross_assets: dict[str, dict[str, Any]]) -> str:
+    def move(symbol: str) -> float | None:
+        return num((cross_assets.get(symbol) or {}).get("change_pct"))
+
+    def shown(symbol: str) -> str:
+        value = move(symbol)
+        return f"{symbol} {pct(value)}" if value is not None else f"{symbol} unavailable"
+
+    if topic == "energy_geopolitics":
+        uso = move("USO")
+        verdict = "confirms an active energy channel" if uso is not None and uso >= 0.35 else (
+            "does not confirm an oil-price shock" if uso is not None and uso <= -0.20 else
+            "shows no decisive oil confirmation"
+        )
+        return f"{shown('USO')} and {shown('UUP')}; the tape {verdict}."
+    if topic in ("rates_inflation", "fed_liquidity"):
+        tlt = move("TLT")
+        verdict = "signals rising-yield pressure" if tlt is not None and tlt <= -0.25 else (
+            "signals easing yield pressure" if tlt is not None and tlt >= 0.25 else
+            "shows no decisive rates confirmation"
+        )
+        return f"{shown('TLT')} and {shown('UUP')}; the tape {verdict}."
+    if topic == "growth_labor":
+        iwm, spy = move("IWM"), move("SPY")
+        spread = iwm - spy if iwm is not None and spy is not None else None
+        verdict = f"IWM relative breadth {pct(spread)} versus SPY" if spread is not None else "relative breadth unavailable"
+        return f"{shown('IWM')} and {shown('SPY')}; {verdict}."
+    if topic == "technology":
+        soxx, qqq = move("SOXX"), move("QQQ")
+        spread = soxx - qqq if soxx is not None and qqq is not None else None
+        verdict = f"SOXX leadership spread {pct(spread)} versus QQQ" if spread is not None else "semiconductor leadership unavailable"
+        return f"{shown('SOXX')} and {shown('QQQ')}; {verdict}."
+    return "No mapped cross-asset confirmation."
+
+
+def load_macro_context(now: datetime, cross_assets: dict[str, dict[str, Any]],
+                       evidence_cutoff: datetime | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    path = DATA / "macro_news.json"
+    payload = read_json(path, {}) or {}
+    state = freshness(payload.get("generated_at"), MACRO_NEWS_MAX_MIN, now)
+    if not state["fresh"]:
+        return [], {"path": path, "state": state, "source_health": payload.get("source_health") or {}}
+    selected, seen_topics = [], set()
+    selection_cutoff = (evidence_cutoff or now).astimezone(UTC)
+    for item in payload.get("items") or []:
+        published = parse_dt(item.get("published_at"))
+        if not published or published > selection_cutoff or selection_cutoff - published > timedelta(hours=36):
+            continue
+        topic = item.get("topic")
+        if topic in seen_topics and len(selected) < 3:
+            continue
+        row = dict(item)
+        row["cross_asset_confirmation"] = macro_confirmation(str(topic), cross_assets)
+        selected.append(row)
+        seen_topics.add(topic)
+        if len(selected) == 3:
+            break
+    return selected, {"path": path, "state": state, "source_health": payload.get("source_health") or {}}
+
+
+def previous_brief(day: date) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    candidates = []
+    for path in ARCHIVE.glob("*/*/*/brief.json"):
+        try:
+            session = date.fromisoformat(path.parent.name)
+        except ValueError:
+            continue
+        if session < day:
+            candidates.append((session, path))
+    if not candidates:
+        return None, None
+    _, path = max(candidates)
+    return read_json(path, {}) or None, read_json(path.parent / "score.json", {}) or None
+
+
+def gex_magnitude_change(current: Any, previous: Any) -> float | None:
+    current_value, previous_value = num(current), num(previous)
+    if current_value is None or previous_value is None or abs(previous_value) < 1:
+        return None
+    return ((abs(current_value) / abs(previous_value)) - 1) * 100
+
+
+def build_change_fingerprint(day: date, label: str, indices: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    previous, score = previous_brief(day)
+    if not previous:
+        return {
+            "previous_date": None,
+            "previous_label": None,
+            "same_label": False,
+            "previous_result": None,
+            "bullets": ["No prior official Catalyst Brief is available for comparison."],
+            "metrics": {},
+        }
+    previous_indices = previous.get("indices") or {}
+    metrics, ranked_changes, bullets = {}, [], []
+    for ticker in ("SPY", "QQQ"):
+        current = indices[ticker]
+        prior = previous_indices.get(ticker) or {}
+        ticker_metrics = {}
+        for tenor_key, tenor_name in (("monthly", "monthly"), ("zero_dte", "0DTE")):
+            change = gex_magnitude_change(
+                current.get(tenor_key, {}).get("net_gex"),
+                prior.get(tenor_key, {}).get("net_gex"),
+            )
+            ticker_metrics[f"{tenor_key}_gex_magnitude_change_pct"] = round(change, 1) if change is not None else None
+            if change is not None:
+                current_gex = abs(num(current.get(tenor_key, {}).get("net_gex")) or 0) / 1_000_000_000
+                previous_gex = abs(num(prior.get(tenor_key, {}).get("net_gex")) or 0) / 1_000_000_000
+                ranked_changes.append((
+                    abs(change),
+                    f"{ticker} {tenor_name} GEX magnitude {'increased' if change >= 0 else 'decreased'} "
+                    f"from {previous_gex:.2f}B to {current_gex:.2f}B ({pct(change, 0)}).",
+                ))
+        current_location = current.get("bars", {}).get("location")
+        previous_location = prior.get("bars", {}).get("location")
+        ticker_metrics["location_change"] = f"{previous_location}->{current_location}"
+        if current_location and previous_location and current_location != previous_location:
+            bullets.append(f"{ticker} moved from {previous_location.replace('_', ' ')} at the prior cutoff to {current_location.replace('_', ' ')} today.")
+        current_width = (num(current.get("bars", {}).get("or_high")) or 0) - (num(current.get("bars", {}).get("or_low")) or 0)
+        previous_width = (num(prior.get("bars", {}).get("or_high")) or 0) - (num(prior.get("bars", {}).get("or_low")) or 0)
+        width_change = ((current_width / previous_width) - 1) * 100 if current_width and previous_width else None
+        ticker_metrics["opening_range_width_change_pct"] = round(width_change, 1) if width_change is not None else None
+        if width_change is not None and abs(width_change) >= 20:
+            bullets.append(f"{ticker}'s opening range is {abs(width_change):.0f}% {'wider' if width_change > 0 else 'narrower'} than the prior session.")
+        metrics[ticker] = ticker_metrics
+    bullets = [sentence for _, sentence in sorted(ranked_changes, reverse=True)[:2]] + bullets
+    previous_label = (previous.get("central") or {}).get("label")
+    previous_result = (score or {}).get("result")
+    if previous_result:
+        bullets.append(f"Yesterday's fixed post-close score was {previous_result}.")
+    return {
+        "previous_date": previous.get("session_date"),
+        "previous_label": previous_label,
+        "same_label": previous_label == label,
+        "previous_result": previous_result,
+        "bullets": bullets[:6],
+        "metrics": metrics,
+    }
+
+
 def describe_index(ticker: str, monthly: dict[str, Any], zero: dict[str, Any],
                    bars: dict[str, Any]) -> dict[str, Any]:
     posture = index_posture(monthly, zero)
@@ -401,16 +599,105 @@ def central_posture(spy: dict[str, Any], qqq: dict[str, Any]) -> tuple[str, str]
     return "CROSS-INDEX DIVERGENCE", "SELECTIVE / NO REGIME GATE"
 
 
+def outside_direction(location: str | None) -> str | None:
+    if location == "above_range":
+        return "up"
+    if location == "below_range":
+        return "down"
+    return None
+
+
 def build_question(label: str, spy: dict[str, Any], qqq: dict[str, Any]) -> str:
+    sb, qb = spy["bars"], qqq["bars"]
+    spy_direction = outside_direction(sb.get("location"))
+    qqq_direction = outside_direction(qb.get("location"))
     if label == "CONFIRMED EXPANSION":
-        return "Can SPY and QQQ sustain acceptance outside their opening ranges, or will nearby gamma walls force the move back into balance?"
+        if spy_direction and not qqq_direction:
+            level = qb.get("or_high") if spy_direction == "up" else qb.get("or_low")
+            return (f"Will SPY's early {spy_direction}side acceptance hold and pull QQQ through {money(level)}, "
+                    f"or will QQQ non-confirmation force SPY back inside {money(sb.get('or_low'))}-{money(sb.get('or_high'))}?")
+        if qqq_direction and not spy_direction:
+            level = sb.get("or_high") if qqq_direction == "up" else sb.get("or_low")
+            return (f"Will QQQ's early {qqq_direction}side acceptance hold and pull SPY through {money(level)}, "
+                    f"or will SPY non-confirmation force QQQ back inside {money(qb.get('or_low'))}-{money(qb.get('or_high'))}?")
+        if spy_direction and spy_direction == qqq_direction:
+            return (f"Can synchronized {spy_direction}side acceptance survive the first retest of SPY "
+                    f"{money(sb.get('or_high') if spy_direction == 'up' else sb.get('or_low'))} and QQQ "
+                    f"{money(qb.get('or_high') if spy_direction == 'up' else qb.get('or_low'))}?")
+        return (f"Will aligned negative GEX convert into a synchronized break of SPY "
+                f"{money(sb.get('or_low'))}-{money(sb.get('or_high'))} and QQQ "
+                f"{money(qb.get('or_low'))}-{money(qb.get('or_high'))}, or remain latent inside both ranges?")
     if label == "CONFIRMED PINNING":
-        return "Will positive-gamma positioning keep SPY and QQQ contained, or will a confirmed opening-range break defeat the expected pin?"
+        return (f"Will positive-gamma positioning keep SPY inside {money(sb.get('or_low'))}-{money(sb.get('or_high'))} "
+                f"and QQQ inside {money(qb.get('or_low'))}-{money(qb.get('or_high'))}, or will a two-close break defeat the pin?")
     if label == "CROSS-INDEX DIVERGENCE":
         return f"Will {spy['ticker']} {spy['posture']} or {qqq['ticker']} {qqq['posture']} control the session, and can either index earn confirmation from the other?"
     if label == "CROSS-TENOR CONFLICT":
-        return "Will the shared monthly-negative/0DTE-positive conflict resolve into sustained expansion, or will the opening move fail back into balance?"
+        return (f"Will SPY and QQQ break the same side of their opening ranges and overpower the 0DTE walls, "
+                "or will the monthly/0DTE conflict produce another failed move?")
     return "Do the available SPY and QQQ inputs support any defensible microstructure thesis today?"
+
+
+def build_daily_read(label: str, spy: dict[str, Any], qqq: dict[str, Any],
+                     changes: dict[str, Any], macro_context: list[dict[str, Any]],
+                     technology: dict[str, Any] | None) -> dict[str, str]:
+    sb, qb = spy["bars"], qqq["bars"]
+    spy_direction = outside_direction(sb.get("location"))
+    qqq_direction = outside_direction(qb.get("location"))
+    if spy_direction and spy_direction == qqq_direction:
+        trigger = f"SPY and QQQ already show synchronized {spy_direction}side opening-range acceptance."
+    elif spy_direction:
+        trigger = f"SPY is the early leader with {spy_direction}side acceptance beyond {money(sb.get('or_high') if spy_direction == 'up' else sb.get('or_low'))}."
+    elif qqq_direction:
+        trigger = f"QQQ is the early leader with {qqq_direction}side acceptance beyond {money(qb.get('or_high') if qqq_direction == 'up' else qb.get('or_low'))}."
+    else:
+        trigger = f"Both indices retain a {label.lower().replace('confirmed ', '')} setup, but neither has earned opening-range acceptance."
+
+    constraints = []
+    if spy_direction != qqq_direction:
+        if spy_direction and not qqq_direction:
+            constraints.append("QQQ remains inside its range and has not confirmed SPY")
+        elif qqq_direction and not spy_direction:
+            constraints.append("SPY remains inside its range and has not confirmed QQQ")
+        elif spy_direction and qqq_direction:
+            constraints.append("SPY and QQQ are accepting opposite directions")
+    if macro_context:
+        top = macro_context[0]
+        constraints.append(
+            f"{top.get('topic', 'macro').replace('_', ' ')} risk: {top.get('headline')} "
+            f"({top.get('cross_asset_confirmation')})"
+        )
+    if technology and technology.get("quadrant") in ("Lagging", "Weakening"):
+        momentum = num(technology.get("rs_mom"))
+        momentum_text = f"{momentum:+.2f}" if momentum is not None else "unavailable"
+        constraints.append(f"XLK is {technology.get('quadrant')} with momentum {momentum_text}")
+    constraint = "; ".join(constraints[:2]) + "." if constraints else "No material cross-index or macro constraint is confirmed yet."
+
+    if label == "CONFIRMED EXPANSION":
+        if spy_direction and spy_direction == qqq_direction:
+            conclusion = f"Expansion is active {spy_direction}; favor only held retests because the regime and tape agree."
+        elif spy_direction or qqq_direction:
+            leader = "SPY" if spy_direction else "QQQ"
+            follower = "QQQ" if spy_direction else "SPY"
+            conclusion = f"Expansion pressure is present, but it is a one-index lead: {leader} triggered while {follower} withheld confirmation. Treat continuation as lower confidence until the follower clears its range."
+        else:
+            conclusion = "Negative GEX creates expansion potential, not a direction. With both indices inside their ranges, the correct read is latent volatility and no ORB confirmation yet."
+    elif label == "CONFIRMED PINNING":
+        conclusion = "Positive GEX supports rotation and mean reversion, but only while both ranges and nearby walls continue to reject price."
+    elif label == "CROSS-TENOR CONFLICT":
+        conclusion = "Monthly and 0DTE positioning disagree. The opening tape must resolve the conflict before either ORB or MR receives a regime advantage."
+    elif label == "CROSS-INDEX DIVERGENCE":
+        conclusion = "The indices disagree on microstructure. Directional exposure is lower quality until leadership becomes synchronized."
+    else:
+        conclusion = "Required evidence is missing or stale; abstention is the only defensible conclusion."
+
+    difference = (changes.get("bullets") or ["No prior official comparison is available."])[0]
+    return {
+        "trigger": trigger,
+        "constraint": constraint,
+        "working_conclusion": conclusion,
+        "what_changed": difference,
+    }
 
 
 def hinge_text(label: str, spy: dict[str, Any], qqq: dict[str, Any]) -> str:
@@ -437,17 +724,17 @@ def build_scenarios(label: str, spy: dict[str, Any], qqq: dict[str, Any]) -> lis
     if label == "CONFIRMED EXPANSION":
         return [
             {"name": "THESIS STRENGTHENS", "tone": "positive", "conditions": [
-                "SPY and QQQ close outside their opening ranges in the same direction.",
-                "The next completed five-minute candle holds outside rather than immediately reclaiming the range.",
-                "Both remain on the confirming side of VWAP.",
+                f"SPY closes beyond {money(sb.get('or_low'))}-{money(sb.get('or_high'))} and QQQ beyond {money(qb.get('or_low'))}-{money(qb.get('or_high'))} in the same direction.",
+                f"The next completed five-minute candle holds outside while SPY stays on the confirming side of VWAP {money(sb.get('vwap'))} and QQQ of {money(qb.get('vwap'))}.",
+                f"The move accepts beyond the nearest 0DTE boundary rather than rejecting at SPY {money(spy['zero_dte'].get('put_wall'))}/{money(spy['zero_dte'].get('call_wall'))} or QQQ {money(qqq['zero_dte'].get('put_wall'))}/{money(qqq['zero_dte'].get('call_wall'))}.",
             ]},
             {"name": "THESIS WEAKENS", "tone": "warning", "conditions": [
-                "Only one index breaks its range while the other remains inside.",
-                "The leader breaks but repeatedly crosses VWAP.",
-                "Price reaches a major wall without acceptance beyond it.",
+                f"Only one index holds outside its range; current locations are SPY {sb.get('location', 'unavailable').replace('_', ' ')} and QQQ {qb.get('location', 'unavailable').replace('_', ' ')}.",
+                f"The leader repeatedly crosses its VWAP (SPY {money(sb.get('vwap'))}; QQQ {money(qb.get('vwap'))}).",
+                "A macro headline is not confirmed by its mapped cross-asset channel, or the nearest 0DTE wall rejects price.",
             ]},
             {"name": "NOT SUPPORTED", "tone": "negative", "conditions": [
-                "Both indices remain inside their opening ranges after 10:15 ET.",
+                f"Both indices are back inside their opening ranges after 10:15 ET (SPY {money(sb.get('or_low'))}-{money(sb.get('or_high'))}; QQQ {money(qb.get('or_low'))}-{money(qb.get('or_high'))}).",
                 "An attempted break closes back inside on the next candle.",
                 "SPY and QQQ resolve in opposite directions.",
             ]},
@@ -527,16 +814,26 @@ def build_packet(day: date, preview: bool = False, fixture: bool = False) -> dic
         monthly_usable = monthly_state["fresh"]
         zero_usable = zero_state["fresh"]
 
+    bar_end = cutoff + timedelta(minutes=1)
     if fixture:
         bars_raw, request_id = fixture_bars(day), "fixture"
+        cross_assets = {
+            symbol: {"previous_close": 100.0, "open": 100.0, "last": 100.0,
+                     "change_pct": 0.0, "session_move_pct": 0.0, "bars": 20}
+            for symbol in CROSS_ASSETS
+        }
+        cross_request_id = "fixture"
     else:
-        bar_end = observed.astimezone(ET) if preview else cutoff + timedelta(minutes=1)
         try:
             bars_raw, request_id = fetch_session_bars(day, bar_end)
         except Exception:
             if not preview:
                 raise
             bars_raw, request_id = fixture_bars(day), "fixture-fallback"
+        try:
+            cross_assets, cross_request_id = fetch_cross_asset_snapshot(day, bar_end)
+        except Exception as exc:
+            cross_assets, cross_request_id = {}, f"unavailable:{type(exc).__name__}"
 
     bars = {ticker: summarize_bars(bars_raw.get(ticker) or [], day) for ticker in ("SPY", "QQQ")}
     monthly = {
@@ -555,6 +852,9 @@ def build_packet(day: date, preview: bool = False, fixture: bool = False) -> dic
     xlks, sector_path = sector_latest()
     calendar, calendar_meta = load_calendar(day, observed)
     focus, catalyst_meta = optional_focus(day, observed)
+    macro_context, macro_meta = load_macro_context(observed, cross_assets, cutoff)
+    indices = {"SPY": spy, "QQQ": qqq}
+    changes = build_change_fingerprint(day, label, indices)
 
     sources = [
         source_record("S1", "monthly_gex", "data/live_gex_snapshot.json",
@@ -576,7 +876,23 @@ def build_packet(day: date, preview: bool = False, fixture: bool = False) -> dic
                                  catalyst_meta["state"]["fresh"], "Only high-confidence EDGAR/openFDA events may enter the thesis."))
     sources.append(source_record("S6", "calendar", str(calendar_meta["path"].relative_to(ROOT)),
                                  calendar_meta["state"].get("generated_at"), iso(observed),
-                                 calendar_meta["state"]["fresh"], "BLS-only coverage; Fed, Treasury, ISM, and company earnings are not yet included."))
+                                 calendar_meta["state"]["fresh"], "BLS scheduled releases; macro-news coverage is reported separately."))
+    sources.append(source_record("S7", "macro_news", str(macro_meta["path"].relative_to(ROOT)),
+                                 macro_meta["state"].get("generated_at"), iso(observed),
+                                 macro_meta["state"]["fresh"],
+                                 f"Source health: {json.dumps(macro_meta.get('source_health') or {}, sort_keys=True)}"))
+    cross_fresh = bool(cross_assets) and all((cross_assets.get(symbol) or {}).get("bars", 0) > 0 for symbol in CROSS_ASSETS)
+    sources.append(source_record("S8", "cross_asset",
+                                 f"{ALPACA_DATA_URL}?{urlencode({'symbols': ','.join(CROSS_ASSETS), 'feed': 'iex'})}",
+                                 bars["SPY"].get("cutoff"), iso(observed), cross_fresh,
+                                 f"Alpaca request IDs: {cross_request_id or 'not returned'}"))
+    if changes.get("previous_date"):
+        previous_date = date.fromisoformat(changes["previous_date"])
+        prior_path = ARCHIVE / f"{previous_date.year:04d}" / f"{previous_date.month:02d}" / previous_date.isoformat() / "brief.json"
+        previous_packet = read_json(prior_path, {}) or {}
+        sources.append(source_record("S9", "prior_brief", str(prior_path.relative_to(ROOT)),
+                                     previous_packet.get("generated_at"), iso(observed), bool(previous_packet),
+                                     f"Prior label {changes.get('previous_label')}; fixed score {changes.get('previous_result') or 'not available'}."))
 
     evidence_rows = []
     for ticker, idx in (("SPY", spy), ("QQQ", qqq)):
@@ -607,6 +923,18 @@ def build_packet(day: date, preview: bool = False, fixture: bool = False) -> dic
             f"{event.get('source')} filed {event.get('filed')}: {event.get('headline')}",
             "Primary-source catalyst for the optional single-name focus; it is not a directional vote by itself.", ["S5"]
         ))
+    if changes.get("previous_date"):
+        evidence_rows.append(evidence(
+            f"E{len(evidence_rows)+1}", "supports" if label == changes.get("previous_label") else "pushes_back", "DAY/OVER/DAY",
+            (changes.get("bullets") or ["No material change calculated."])[0],
+            "Separates a repeated headline regime from a repeated internal setup.", ["S1", "S2", "S3", "S9"]
+        ))
+    for item in macro_context[:2]:
+        evidence_rows.append(evidence(
+            f"E{len(evidence_rows)+1}", "pushes_back", f"MACRO/{str(item.get('topic')).upper()}",
+            f"{item.get('source')} at {item.get('published_at')}: {item.get('headline')} Cross-asset check: {item.get('cross_asset_confirmation')}",
+            f"{item.get('mechanism')} This is context, not a directional vote by itself.", ["S7", "S8"]
+        ))
 
     stale = [s["id"] for s in sources if not s["fresh"] and s["id"] in ("S1", "S2", "S3")]
     quality = "DEGRADED" if stale or request_id.startswith("fixture") else "FRESH"
@@ -616,16 +944,16 @@ def build_packet(day: date, preview: bool = False, fixture: bool = False) -> dic
         question = build_question(label, spy, qqq)
         hinge = hinge_text(label, spy, qqq)
 
-    conclusion = {
-        "CONFIRMED EXPANSION": "Both indices have aligned expansion-compatible GEX. Direction must be earned through synchronized range acceptance.",
-        "CONFIRMED PINNING": "Both indices have aligned pinning-compatible GEX. Mean reversion remains the working expectation until a two-close range break.",
-        "CROSS-INDEX DIVERGENCE": "SPY and QQQ do not share the same microstructure posture. Expect lower confidence until one earns confirmation from the other.",
-        "CROSS-TENOR CONFLICT": "Both indices show the same monthly-negative/0DTE-positive conflict. Directional conviction is withheld until price resolves the tenor disagreement.",
-        "INSUFFICIENT EVIDENCE": "Required evidence is missing or stale. The system abstains instead of manufacturing a session thesis.",
-    }[label]
+    macro_quality = (
+        "FRESH" if macro_meta["state"]["fresh"] and macro_context else
+        "NO QUALIFYING ITEMS" if macro_meta["state"]["fresh"] else
+        "UNAVAILABLE"
+    )
+    daily_read = build_daily_read(label, spy, qqq, changes, macro_context, xlks)
+
 
     return {
-        "schema_version": "catalyst-brief-1.0",
+        "schema_version": "catalyst-brief-2.0",
         "report_id": f"CB-{day.isoformat()}{'-PREVIEW' if preview else ''}",
         "session_date": day.isoformat(),
         "edition": "PREVIEW - AFTER-CLOSE INPUTS" if preview else "09:55 ET SESSION PLAYBOOK",
@@ -633,15 +961,22 @@ def build_packet(day: date, preview: bool = False, fixture: bool = False) -> dic
         "generated_at": iso(observed),
         "evidence_cutoff": iso(cutoff),
         "data_quality": quality,
+        "macro_quality": macro_quality,
         "stale_required_sources": stale,
         "central": {
             "label": label,
             "strategy_compatibility": compatibility,
             "question": question,
-            "working_conclusion": conclusion,
+            "trigger": daily_read["trigger"],
+            "constraint": daily_read["constraint"],
+            "working_conclusion": daily_read["working_conclusion"],
+            "what_changed": daily_read["what_changed"],
             "narrative_hinge": hinge,
         },
-        "indices": {"SPY": spy, "QQQ": qqq},
+        "indices": indices,
+        "change_fingerprint": changes,
+        "macro_context": macro_context,
+        "cross_assets": cross_assets,
         "technology_context": xlks,
         "optional_focus": focus,
         "calendar": calendar,
@@ -750,7 +1085,7 @@ def render_pdf(packet: dict[str, Any], out_path: Path) -> None:
         [Paragraph("BOT_NEXUS / DAILY RESEARCH", styles["eyebrow"]),
          Paragraph(ptext(packet["edition"]), styles["eyebrow"])],
         [Paragraph("CATALYST BRIEF", styles["title"]),
-         Paragraph(f"{ptext(packet['session_date'])}<br/>{ptext(packet['data_quality'])}", styles["white"])],
+         Paragraph(f"{ptext(packet['session_date'])}<br/>CORE {ptext(packet['data_quality'])}<br/>MACRO {ptext(packet.get('macro_quality', 'UNKNOWN'))}", styles["white"])],
     ], colWidths=[4.8 * inch, 2.1 * inch])
     header.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), NAVY),
@@ -771,19 +1106,23 @@ def render_pdf(packet: dict[str, Any], out_path: Path) -> None:
         [Paragraph(ptext(central["label"]), styles["center"]),
          Paragraph(ptext(central["strategy_compatibility"]), styles["center"])],
         [Paragraph(f"<b>SESSION QUESTION</b><br/>{ptext(central['question'])}", styles["body"]), ""],
+        [Paragraph(f"<b>TRIGGER</b><br/>{ptext(central.get('trigger'))}", styles["body"]), ""],
+        [Paragraph(f"<b>CONSTRAINT</b><br/>{ptext(central.get('constraint'))}", styles["body"]), ""],
         [Paragraph(f"<b>WORKING CONCLUSION</b><br/>{ptext(central['working_conclusion'])}", styles["body"]), ""],
+        [Paragraph(f"<b>WHAT CHANGED</b><br/>{ptext(central.get('what_changed'))}", styles["body"]), ""],
         [Paragraph(f"<b>NARRATIVE HINGE</b><br/>{ptext(central['narrative_hinge'])}", styles["body"]), ""],
     ], colWidths=[4.9 * inch, 2.0 * inch])
-    thesis.setStyle(TableStyle([
+    thesis_commands = [
         ("BACKGROUND", (0, 0), (0, 0), badge_color),
         ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#D9E2E8")),
-        ("SPAN", (0, 1), (1, 1)), ("SPAN", (0, 2), (1, 2)), ("SPAN", (0, 3), (1, 3)),
         ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#CAD4DB")),
         ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8E0E5")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9),
-        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-    ]))
+        ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]
+    thesis_commands.extend(("SPAN", (0, row), (1, row)) for row in range(1, 7))
+    thesis.setStyle(TableStyle(thesis_commands))
     story += [thesis, Spacer(1, 10)]
     cards = Table([[index_card(packet["indices"]["SPY"], styles),
                     index_card(packet["indices"]["QQQ"], styles)]],
@@ -793,7 +1132,7 @@ def render_pdf(packet: dict[str, Any], out_path: Path) -> None:
                                ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
     story += [cards, Spacer(1, 9)]
 
-    story.append(Paragraph("EVIDENCE BALANCE", styles["h1"]))
+    story += [PageBreak(), Paragraph("EVIDENCE BALANCE", styles["h1"])]
     ev_rows = [[Paragraph("SIDE", styles["center"]), Paragraph("OBSERVED DATA", styles["center"]),
                 Paragraph("ROLE IN THESIS", styles["center"]), Paragraph("SOURCE", styles["center"])]]
     for row in packet["evidence"]:
@@ -815,9 +1154,19 @@ def render_pdf(packet: dict[str, Any], out_path: Path) -> None:
     for i, row in enumerate(packet["evidence"], start=1):
         style_cmds.append(("BACKGROUND", (0, i), (0, i), colors.HexColor("#DDF5F1") if row["side"] == "supports" else colors.HexColor("#FBE7E9")))
     ev_table.setStyle(TableStyle(style_cmds))
-    story += [ev_table, PageBreak()]
+    story += [ev_table, Spacer(1, 8)]
 
-    story.append(Paragraph("THREE FIXED PATHS", styles["h1"]))
+    story.append(Paragraph("WHAT CHANGED SINCE THE PRIOR REPORT", styles["h1"]))
+    fingerprint = packet.get("change_fingerprint") or {}
+    for bullet in fingerprint.get("bullets") or ["No prior official comparison is available."]:
+        story.append(Paragraph(f"- {ptext(bullet)}", styles["body"]))
+    if fingerprint.get("same_label"):
+        story.append(Paragraph(
+            "<b>Repeated label does not mean repeated setup.</b> Compare GEX magnitude, opening-range location, "
+            "range width, wall migration, and the prior fixed score before treating the sessions as equivalent. [S9]",
+            styles["small"],
+        ))
+    story.append(Paragraph("THREE DAILY PATHS", styles["h1"]))
     tone_colors = {"positive": TEAL, "warning": GOLD, "negative": RED}
     for scenario in packet["scenarios"]:
         lines = "<br/>".join(f"- {ptext(c)}" for c in scenario["conditions"])
@@ -832,6 +1181,38 @@ def render_pdf(packet: dict[str, Any], out_path: Path) -> None:
             ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
         ]))
         story += [KeepTogether(box), Spacer(1, 7)]
+
+    story.append(Paragraph("MACRO NEWS + TAPE CONFIRMATION", styles["h1"]))
+    macro_rows = packet.get("macro_context") or []
+    if macro_rows:
+        rows = [[Paragraph("TIME / TOPIC", styles["center"]), Paragraph("HEADLINE + MECHANISM", styles["center"]),
+                 Paragraph("CROSS-ASSET CHECK", styles["center"])]]
+        for item in macro_rows:
+            source_link = (
+                f'<link href="{ptext(item.get("url"))}" color="#0B7F75">{ptext(item.get("source"))}</link>'
+                if item.get("url") else ptext(item.get("source"))
+            )
+            rows.append([
+                Paragraph(f"{ptext(item.get('published_at'))}<br/><b>{ptext(str(item.get('topic')).replace('_', ' ').upper())}</b><br/>{ptext(item.get('impact'))}", styles["small"]),
+                Paragraph(f"<b>{ptext(item.get('headline'))}</b><br/>{ptext(item.get('mechanism'))}<br/>{source_link} [S7]", styles["small"]),
+                Paragraph(f"{ptext(item.get('cross_asset_confirmation'))} [S8]", styles["small"]),
+            ])
+        macro_table = Table(rows, colWidths=[1.35 * inch, 3.55 * inch, 2.0 * inch], repeatRows=1)
+        macro_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), INK), ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#CBD5DC")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8E0E5")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(macro_table)
+    else:
+        story.append(Paragraph(
+            "No qualifying fresh macro item entered the packet. Check the MACRO status in the header and [S7] "
+            "source health; absence is not represented as complete macro coverage.",
+            styles["body"],
+        ))
 
     story.append(Paragraph("KNOWN CALENDAR", styles["h1"]))
     if packet["calendar"]:
@@ -854,7 +1235,7 @@ def render_pdf(packet: dict[str, Any], out_path: Path) -> None:
         ]))
         story += [cal]
     else:
-        story.append(Paragraph("No qualifying BLS release was present for this session, or the BLS feed was unavailable. Fed, Treasury, ISM, and company earnings are not yet covered. [S6]", styles["body"]))
+        story.append(Paragraph("No qualifying BLS release was scheduled for this session, or the BLS calendar was unavailable. This calendar row is separate from the macro-news section above. [S6]", styles["body"]))
 
     story.append(Paragraph("OPTIONAL SINGLE-NAME FOCUS", styles["h1"]))
     focus = packet.get("optional_focus")

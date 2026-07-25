@@ -33,6 +33,9 @@ esac
 
 echo "$(date -u +%FT%TZ) starting catalyst brief $MODE" >> "$LOG"
 cd "$ROOT" || exit 1
+if [ "$MODE" = "build" ]; then
+  "$ROOT/venv/bin/python" "$ROOT/macro_news_pull.py" >> "$LOG" 2>&1 ||     echo "$(date -u +%FT%TZ) macro refresh failed; report will disclose unavailable macro coverage" >> "$LOG"
+fi
 "$ROOT/venv/bin/python" "$ROOT/catalyst_brief.py" --mode "$MODE" --publish >> "$LOG" 2>&1
 STATUS=$?
 if [ "$STATUS" -eq 0 ] && [ "$MODE" = "build" ]; then

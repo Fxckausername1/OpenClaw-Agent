@@ -19,5 +19,7 @@ cd "$ROOT" || exit 1
 CAL_STATUS=$?
 "$ROOT/venv/bin/python" "$ROOT/catalyst_news_pull.py" >> "$LOG" 2>&1
 CAT_STATUS=$?
-echo "$(date -u +%FT%TZ) calendar=$CAL_STATUS catalyst=$CAT_STATUS" >> "$LOG"
-[ "$CAL_STATUS" -eq 0 ] && [ "$CAT_STATUS" -eq 0 ]
+"$ROOT/venv/bin/python" "$ROOT/macro_news_pull.py" >> "$LOG" 2>&1
+MACRO_STATUS=$?
+echo "$(date -u +%FT%TZ) calendar=$CAL_STATUS catalyst=$CAT_STATUS macro=$MACRO_STATUS" >> "$LOG"
+[ "$CAL_STATUS" -eq 0 ] && [ "$CAT_STATUS" -eq 0 ] && [ "$MACRO_STATUS" -eq 0 ]
