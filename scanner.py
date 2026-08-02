@@ -27,22 +27,40 @@ except Exception:
 
 
 def fetch_sp100():
-    url = "https://en.wikipedia.org/wiki/S%26P_100"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    table = soup.find("table", {"class": "wikitable"})
-    tickers = []
-    if not table:
-        return []
-    for row in table.find_all("tr")[1:]:
-        cols = row.find_all("td")
-        if not cols:
-            continue
-        sym = cols[0].get_text(strip=True)
-        sym = sym.replace('.', '-')
-        tickers.append(sym)
-    return tickers[:100]
+    # Try Wikipedia first (with a browser UA); if that fails, fall back to a hardcoded S&P-100 list.
+    try:
+        url = "https://en.wikipedia.org/wiki/S%26P_100"
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table", {"class": "wikitable"})
+        tickers = []
+        if table:
+            for row in table.find_all("tr")[1:]:
+                cols = row.find_all("td")
+                if not cols:
+                    continue
+                sym = cols[0].get_text(strip=True)
+                sym = sym.replace('.', '-')
+                tickers.append(sym)
+            if tickers:
+                return tickers[:100]
+    except Exception:
+        pass
+
+    # Fallback hardcoded list (common S&P-100 constituents)
+    return [
+        'AAPL','MSFT','AMZN','NVDA','GOOG','GOOGL','META','TSLA','BRK-B','JNJ',
+        'V','UNH','PG','MA','HD','BAC','XOM','CVX','KO','PFE',
+        'MRK','ABBV','WMT','DIS','NFLX','ORCL','INTC','CSCO','T','VZ',
+        'CRM','MCD','NKE','SBUX','UPS','MMM','CAT','BA','LLY','COST',
+        'ABT','TXN','QCOM','AMGN','DHR','BMY','MDLZ','PM','HON','AMAT',
+        'GILD','ADP','SPG','BLK','SYK','RTX','GE','ISRG','ZTS','BKNG',
+        'SPGI','NOW','TMUS','CVS','SCHW','PLD','ADI','LMT','ATVI','CL',
+        'EMR','FDX','GD','HLT','ICE','ITW','KMB','KMI','KHC','MDT',
+        'MET','FIS','CI','VRTX','REGN','GPN','MS','GS','AXP','PYPL',
+        'ZM','DXCM','ROP','LRCX','MU','SQ','MAR','EW','NOC','PNC'
+    ]
 
 
 def get_minute_data(ticker, days=7):

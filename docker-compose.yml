@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  pipeline:
+    build: .
+    environment:
+      - APIFY_TOKEN
+      - IG_ALLOW_DM_ONLY
+    volumes:
+      - ./:/app
+    command: python artist_pipeline.py
+

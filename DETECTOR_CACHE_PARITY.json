@@ -1,0 +1,52 @@
+{
+  "sessions_run": 162,
+  "frozen_events_expected": 1804,
+  "events_emitted": 1804,
+  "sessions_mismatched": 0,
+  "duplicate_emissions": 0,
+  "mismatch_examples": [],
+  "index_offset_anomalies": [],
+  "restart_simulations": [
+    {
+      "session": "2025-12-03",
+      "restart_after_chunk": 0,
+      "events_without_restart": 4,
+      "events_with_restart": 4,
+      "identical": true,
+      "duplicate_emissions": 0
+    },
+    {
+      "session": "2025-12-04",
+      "restart_after_chunk": 1,
+      "events_without_restart": 8,
+      "events_with_restart": 8,
+      "identical": true,
+      "duplicate_emissions": 0
+    },
+    {
+      "session": "2025-12-05",
+      "restart_after_chunk": 2,
+      "events_without_restart": 11,
+      "events_with_restart": 11,
+      "identical": true,
+      "duplicate_emissions": 0
+    },
+    {
+      "session": "2025-12-08",
+      "restart_after_chunk": 3,
+      "events_without_restart": 16,
+      "events_with_restart": 16,
+      "identical": true,
+      "duplicate_emissions": 0
+    },
+    {
+      "session": "2025-12-09",
+      "restart_after_chunk": 0,
+      "events_without_restart": 14,
+      "events_with_restart": 14,
+      "identical": true,
+      "duplicate_emissions": 0
+    }
+  ],
+  "PARITY_PASS": true
+}

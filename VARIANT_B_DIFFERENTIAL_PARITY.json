@@ -1,0 +1,60 @@
+{
+  "config_identical": true,
+  "variant_b_config": "SelectorConfig(allowed_dte=frozenset({0, 1, 2}), premium_low=0.0, premium_high=inf, max_spread_dollars=0.05, max_spread_pct_mid=0.15, min_abs_delta=0.15, max_quote_age_seconds=10.0, min_ask_size=5.0, target_delta=0.35)",
+  "original_b_config": "SelectorConfig(allowed_dte=frozenset({0, 1, 2}), premium_low=0.0, premium_high=inf, max_spread_dollars=0.05, max_spread_pct_mid=0.15, min_abs_delta=0.15, max_quote_age_seconds=10.0, min_ask_size=5.0, target_delta=0.35)",
+  "excluded_triggers": [
+    "SWEEP_RECLAIM"
+  ],
+  "total_decisions_all_triggers": 1804,
+  "total_decisions_eligible": 1492,
+  "total_decisions_excluded_by_new_selector": 312,
+  "skipped_sessions": [],
+  "eligible": {
+    "exact_matches": 1492,
+    "mismatches": 0,
+    "both_selected": 1427,
+    "both_rejected": 65,
+    "by_category": {
+      "selection_vs_rejection": 0,
+      "occ": 0,
+      "rejection_reason": 0,
+      "contract_field": 0,
+      "candidates_checked": 0,
+      "patch_leak": 0
+    },
+    "first_examples": {
+      "selection_vs_rejection": null,
+      "occ": null,
+      "rejection_reason": null,
+      "contract_field": null,
+      "candidates_checked": null,
+      "patch_leak": null
+    }
+  },
+  "all_triggers": {
+    "exact_matches": 1804,
+    "mismatches": 0,
+    "by_category": {
+      "selection_vs_rejection": 0,
+      "occ": 0,
+      "rejection_reason": 0,
+      "contract_field": 0,
+      "candidates_checked": 0,
+      "patch_leak": 0
+    },
+    "first_examples": {
+      "selection_vs_rejection": null,
+      "occ": null,
+      "rejection_reason": null,
+      "contract_field": null,
+      "candidates_checked": null,
+      "patch_leak": null
+    }
+  },
+  "ranking_evidence": {
+    "decisions_with_passing_candidates": 1731,
+    "delta_tiebreak_exercised": 2,
+    "full_key_ties_order_dependent": 0
+  },
+  "PARITY_PASS": true
+}

@@ -1,0 +1,103 @@
+{
+  "source": "data/thetadata/runs/selector_policy_experiment_v1/20260801T180703Z-bbfc8c/raw_rows.json",
+  "variant": "B_delta_first_debit_cap",
+  "sweep_reclaim_rows_removed": 312,
+  "blocks": [
+    {
+      "candidate": "VARIANT_B (as published)",
+      "label": "train",
+      "signals": 1432,
+      "sessions": 130,
+      "filled_trades": 1291,
+      "fill_rate": 0.9015,
+      "sessions_with_a_fill": 130,
+      "win_rate": 0.6336,
+      "mean_net_pnl": 8.0325,
+      "ci95_low": 6.9139,
+      "ci95_high": 9.1494,
+      "total_net_pnl": 10369.9,
+      "profit_factor": 2.472
+    },
+    {
+      "candidate": "VARIANT_B_NO_SWEEP",
+      "label": "train",
+      "signals": 1189,
+      "sessions": 130,
+      "filled_trades": 1073,
+      "fill_rate": 0.9024,
+      "sessions_with_a_fill": 130,
+      "win_rate": 0.6598,
+      "mean_net_pnl": 8.8366,
+      "ci95_low": 7.6978,
+      "ci95_high": 9.9848,
+      "total_net_pnl": 9481.7,
+      "profit_factor": 2.791
+    },
+    {
+      "candidate": "VARIANT_B (as published)",
+      "label": "holdout",
+      "signals": 372,
+      "sessions": 32,
+      "filled_trades": 345,
+      "fill_rate": 0.9274,
+      "sessions_with_a_fill": 32,
+      "win_rate": 0.6029,
+      "mean_net_pnl": 7.642,
+      "ci95_low": 5.0101,
+      "ci95_high": 10.2855,
+      "total_net_pnl": 2636.5,
+      "profit_factor": 2.167
+    },
+    {
+      "candidate": "VARIANT_B_NO_SWEEP",
+      "label": "holdout",
+      "signals": 303,
+      "sessions": 32,
+      "filled_trades": 283,
+      "fill_rate": 0.934,
+      "sessions_with_a_fill": 32,
+      "win_rate": 0.6431,
+      "mean_net_pnl": 8.7481,
+      "ci95_low": 6.112,
+      "ci95_high": 11.5784,
+      "total_net_pnl": 2475.7,
+      "profit_factor": 2.521
+    },
+    {
+      "candidate": "VARIANT_B (as published)",
+      "label": "ALL",
+      "signals": 1804,
+      "sessions": 162,
+      "filled_trades": 1636,
+      "fill_rate": 0.9069,
+      "sessions_with_a_fill": 162,
+      "win_rate": 0.6271,
+      "mean_net_pnl": 7.9501,
+      "ci95_low": 6.9257,
+      "ci95_high": 8.996,
+      "total_net_pnl": 13006.4,
+      "profit_factor": 2.398
+    },
+    {
+      "candidate": "VARIANT_B_NO_SWEEP",
+      "label": "ALL",
+      "signals": 1492,
+      "sessions": 162,
+      "filled_trades": 1356,
+      "fill_rate": 0.9088,
+      "sessions_with_a_fill": 162,
+      "win_rate": 0.6563,
+      "mean_net_pnl": 8.8181,
+      "ci95_low": 7.7621,
+      "ci95_high": 9.9088,
+      "total_net_pnl": 11957.4,
+      "profit_factor": 2.727
+    }
+  ],
+  "trigger_composition": {
+    "MSS": 319,
+    "PULLBACK": 838,
+    "MA_FADE": 167,
+    "BOS": 168
+  }
+}
