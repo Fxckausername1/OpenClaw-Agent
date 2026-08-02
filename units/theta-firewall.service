@@ -1,0 +1,16 @@
+[Unit]
+Description=Restore ThetaData port DROP rule (25503,25520 non-loopback)
+DefaultDependencies=no
+After=network-pre.target
+Before=network-online.target theta-terminal.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# -C tests for the rule first, so this is idempotent and safe to re-run.
+ExecStart=/bin/sh -c '/usr/sbin/iptables -C INPUT ! -i lo -p tcp -m multiport --dports 25503,25520 -j DROP 2>/dev/null || /usr/sbin/iptables -A INPUT ! -i lo -p tcp -m multiport --dports 25503,25520 -j DROP'
+ExecStop=/bin/true
+
+[Install]
+WantedBy=multi-user.target

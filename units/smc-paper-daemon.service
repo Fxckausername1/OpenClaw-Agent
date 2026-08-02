@@ -1,0 +1,42 @@
+[Unit]
+Description=SMC Alpaca PAPER daemon (VARIANT_B_NO_SWEEP)
+Documentation=file:///home/heff/.openclaw/workspace/CUTOVER_PLAN.md
+Requires=theta-terminal.service
+After=theta-terminal.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=heff
+Group=heff
+WorkingDirectory=/home/heff/.openclaw/workspace
+
+Environment=HOME=/home/heff
+Environment=PYTHONUNBUFFERED=1
+
+# PAPER ONLY. There is deliberately no --live flag here and the paper guard
+# terminates the process at startup if the resolved host is not
+# paper-api.alpaca.markets.
+ExecStart=/home/heff/.openclaw/workspace/venv/bin/python -m smc.run_daemon --mode paper-forward
+
+Restart=always
+RestartSec=15
+TimeoutStartSec=180
+# The daemon blocks new entries, flushes SQLite, stops workers in order and
+# releases its singleton on SIGTERM. Give that room to finish rather than
+# SIGKILLing mid-commit.
+TimeoutStopSec=90
+KillSignal=SIGTERM
+KillMode=control-group
+SuccessExitStatus=143 SIGTERM
+
+# Backoff so a persistent failure does not hammer the broker or ThetaData.
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=smc-paper
+
+[Install]
+WantedBy=multi-user.target

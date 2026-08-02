@@ -1,0 +1,33 @@
+# --- environments / vendored (never publish) ---
+venv/
+.venv/
+trading-venv/
+node_modules/
+trading-stack/
+stockfish/
+
+# --- secrets ---
+credentials/
+keys/
+*.pem
+*.key
+sa.json
+
+# --- caches ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- logs & generated data ---
+logs/
+data/
+runs/
+backtest-output/
+output/
+*.log
+*.tmp
+*.bak
+*.bak_*
+backups/
