@@ -1,0 +1,37 @@
+[Unit]
+Description=ThetaData Terminal (market data feed for SMC paper pipeline)
+Documentation=https://http-docs.thetadata.us/
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=heff
+Group=heff
+WorkingDirectory=/home/heff/.openclaw/thetadata-terminal
+
+# The bootstrap jar forks a second JVM via bare `java`, so this runtime must be on PATH.
+Environment=PATH=/home/heff/.local/opt/temurin21/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/heff
+EnvironmentFile=/etc/theta-terminal.env
+
+# Theta v3 binds its HTTP and WebSocket listeners to all interfaces. Install an
+# idempotent host-firewall rule before either listener can start.
+ExecStartPre=+/usr/local/sbin/theta-terminal-firewall install
+ExecStart=/home/heff/.local/opt/temurin21/bin/java -jar /home/heff/.openclaw/thetadata-terminal/ThetaTerminalv3.jar
+
+Restart=always
+RestartSec=10
+TimeoutStartSec=120
+TimeoutStopSec=30
+KillMode=control-group
+SuccessExitStatus=143 SIGTERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=theta-terminal
+
+[Install]
+WantedBy=multi-user.target
