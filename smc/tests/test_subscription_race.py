@@ -10,6 +10,56 @@ import threading
 import time
 import unittest
 
+from smc.runner import MIN_SUBSCRIPTION_COVERAGE, PaperRunner
+
+
+class _Stream:
+    def __init__(self, n_sub, n_desired, connected=True, pinned_missing=()):
+        self._h = {"n_subscribed": n_sub, "n_desired": n_desired,
+                   "generation": 1, "pinned_unsubscribed": list(pinned_missing)}
+        self._connected = connected
+
+    def health(self):
+        return self._h
+
+    def is_connected(self):
+        return self._connected
+
+
+class SubscriptionCoverageTests(unittest.TestCase):
+    """Full coverage was required, which caught the startup race but also
+    flipped entries off mid-session on routine universe churn (observed live:
+    300/300 -> 191/300 with a perfectly healthy feed)."""
+
+    def _gate(self, stream):
+        r = PaperRunner(theta_stream=stream)
+        r._gate_stream()
+        return r.readiness.gates["theta_stream_connected"]
+
+    def test_startup_race_still_blocks(self):
+        self.assertFalse(self._gate(_Stream(0, 826)).passing)
+
+    def test_routine_churn_no_longer_blocks(self):
+        self.assertTrue(self._gate(_Stream(291, 300)).passing)
+
+    def test_deep_shortfall_still_blocks(self):
+        gate = self._gate(_Stream(191, 300))
+        self.assertFalse(gate.passing)
+        self.assertIn("%", gate.reason)
+
+    def test_threshold_boundary(self):
+        n = 300
+        self.assertTrue(self._gate(_Stream(int(n * MIN_SUBSCRIPTION_COVERAGE), n)).passing)
+
+    def test_disconnected_blocks_regardless_of_coverage(self):
+        self.assertFalse(self._gate(_Stream(300, 300, connected=False)).passing)
+
+    def test_an_unsubscribed_HELD_contract_blocks_at_any_coverage(self):
+        """No tolerance for a position we cannot price."""
+        gate = self._gate(_Stream(299, 300, pinned_missing=["QQQ260803C00580000"]))
+        self.assertFalse(gate.passing)
+        self.assertIn("held contract", gate.reason)
+
 from smc import events as ev
 from smc.events import make_event
 from smc.readiness import GATES, MARKET_CLOSED, PASS, RED, Readiness

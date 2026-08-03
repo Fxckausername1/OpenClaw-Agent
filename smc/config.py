@@ -103,6 +103,23 @@ class SmcConfig:
     max_quote_age_seconds: float = 10.0
     fallback_quote_feed: str = "indicative"
 
+    # ------------------------------------------------- subscription breadth
+    # How much of the chain to actually STREAM. Subscribing to the whole
+    # discovered chain (1,170 contracts on 2026-08-03) saturated this
+    # single-core box during RTH: keepalive pings timed out, the socket
+    # reconnected 212 times, 0/1170 subscriptions were ever acknowledged, and
+    # the detector ran 12-18s against a 900ms ceiling. Nothing could trade.
+    #
+    # Narrowing costs no real candidates. Variant B buys the tightest spread
+    # under a $100 debit cap -- roughly <=$1.00 premium -- so deep ITM (too
+    # expensive) and far OTM (too wide) contracts are never selectable. These
+    # bounds keep everything that could be bought and drop what could not.
+    #
+    # Both bounds apply; whichever is tighter wins. Set strikes_per_side to 0
+    # to disable narrowing entirely and stream the full discovered chain.
+    subscription_strikes_per_side: int = 25   # nearest N strikes each side of spot
+    subscription_band_pct: float = 0.04       # ...and never beyond +/-4% of spot
+
     # PAPER-ONLY: permit an indicative quote to price an ENTRY when OPRA is
     # unavailable. Measured 2026-08-01: this account returns
     #   HTTP 403 {"message":"OPRA agreement is not signed"}
@@ -212,6 +229,7 @@ def load_config() -> SmcConfig:
         "max_entries_per_window": int, "entry_window_minutes": int,
         "max_consecutive_losses": int, "max_execution_failures": int,
         "urgent_poll_seconds": float, "supervisor_poll_seconds": float,
+        "subscription_strikes_per_side": int, "subscription_band_pct": float,
     }
     for field, caster in numeric_fields.items():
         raw = os.environ.get(f"SMC_{field.upper()}")

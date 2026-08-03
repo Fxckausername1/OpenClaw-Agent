@@ -85,9 +85,14 @@ class ThetaMarketDataCache:
     arrival); get_book()/get_quote_row() only ever read what refresh()
     already fetched -- neither ever triggers a network call itself."""
 
-    def __init__(self, symbol: str = "QQQ", dte_targets: tuple = (0, 1, 2)):
+    def __init__(self, symbol: str = "QQQ", dte_targets: tuple = (0, 1, 2),
+                 subscription_strikes_per_side: int = 25,
+                 subscription_band_pct: float = 0.04):
         self.symbol = symbol
         self.dte_targets = dte_targets
+        # How much of the chain to stream. See candidate_occs().
+        self.subscription_strikes_per_side = subscription_strikes_per_side
+        self.subscription_band_pct = subscription_band_pct
         self._entries: dict = {}   # expiration -> CacheEntry
         self._client = None
         self.last_discovery = None   # smc.expirations.ExpirationDiscovery
@@ -277,26 +282,85 @@ class ThetaMarketDataCache:
                 "taken_ts": dt.datetime.now(dt.timezone.utc),
                 "deltas": out}
 
-    def candidate_occs(self) -> tuple:
-        """All real contracts in the latest discovered cache.
+    def candidate_occs(self, strikes_per_side: Optional[int] = None,
+                       band_pct: Optional[float] = None) -> tuple:
+        """Contracts to actually stream, derived from rows ThetaData really
+        returned -- never from calendar or strike guesses.
 
-        This is the subscription source of truth. It is derived from rows
-        ThetaData actually returned, never from calendar or strike guesses.
+        BOUNDED BY MONEYNESS. Returning the whole discovered chain (1,170
+        contracts) saturated the single-core box during RTH: keepalive pings
+        timed out, the socket reconnected 212 times, not one subscription was
+        ever acknowledged, and nothing could trade. Since the selector buys
+        the tightest spread under a $100 debit cap, contracts far from spot
+        are unselectable anyway -- so this drops what could never be bought
+        and keeps everything that could.
+
+        Fails OPEN: if spot cannot be established, the full set is returned.
+        A universe narrowed around an unknown centre would be worse than a
+        wide one, because it could silently exclude the money.
         """
+        strikes_per_side = (self.subscription_strikes_per_side
+                            if strikes_per_side is None else strikes_per_side)
+        band_pct = self.subscription_band_pct if band_pct is None else band_pct
+
         with self._lock:
             entries = tuple(self._entries.values())
+
+        spot = self._underlying_price(entries)
         occs = set()
         for entry in entries:
+            rows = []
             for row in entry.book.itertuples(index=False):
                 try:
-                    occs.add(build_occ_symbol(
-                        self.symbol,
-                        row.expiration if isinstance(row.expiration, dt.date)
-                        else dt.date.fromisoformat(str(row.expiration)[:10]),
-                        float(row.strike), normalize_right(row.right)))
+                    expiration = (row.expiration if isinstance(row.expiration, dt.date)
+                                  else dt.date.fromisoformat(str(row.expiration)[:10]))
+                    rows.append((float(row.strike), normalize_right(row.right),
+                                 expiration))
                 except (AttributeError, TypeError, ValueError):
                     continue
+            if spot is not None and strikes_per_side and strikes_per_side > 0:
+                rows = self._near_the_money(rows, spot, strikes_per_side, band_pct)
+            for strike, right, expiration in rows:
+                try:
+                    occs.add(build_occ_symbol(self.symbol, expiration, strike, right))
+                except (TypeError, ValueError):
+                    continue
         return tuple(sorted(occs))
+
+    @staticmethod
+    def _near_the_money(rows, spot: float, strikes_per_side: int,
+                        band_pct: float) -> list:
+        """Nearest N strikes each side of spot, per right, additionally capped
+        to a percentage band. Both bounds apply; the tighter one wins."""
+        limit = abs(spot) * float(band_pct) if band_pct else None
+        kept = []
+        for right in {r for _, r, _ in rows}:
+            side = sorted((r for r in rows if r[1] == right),
+                          key=lambda r: abs(r[0] - spot))
+            for strike, rgt, expiration in side[:strikes_per_side * 2]:
+                if limit is not None and abs(strike - spot) > limit:
+                    continue
+                kept.append((strike, rgt, expiration))
+        return kept
+
+    def _underlying_price(self, entries) -> Optional[float]:
+        """Spot from the Greek rows. Median rather than first, so one bad row
+        cannot re-centre the whole subscription universe."""
+        prices = []
+        for entry in entries:
+            if "underlying_price" not in entry.book.columns:
+                continue
+            for value in entry.book["underlying_price"].tolist():
+                try:
+                    price = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    prices.append(price)
+        if not prices:
+            return None
+        prices.sort()
+        return prices[len(prices) // 2]
 
     def cache_age_seconds(self, expiration: dt.date) -> Optional[float]:
         entry = self._entries.get(expiration)

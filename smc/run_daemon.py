@@ -248,9 +248,15 @@ class Daemon:
         occs = set()
         try:
             from smc.theta_market_data import ThetaMarketDataCache
-            greeks = ThetaMarketDataCache()
+            greeks = ThetaMarketDataCache(
+                subscription_strikes_per_side=config.subscription_strikes_per_side,
+                subscription_band_pct=config.subscription_band_pct)
             greeks.refresh()
             occs = set(greeks.candidate_occs())
+            logger.info("subscription universe: %d contracts "
+                        "(strikes_per_side=%s, band_pct=%s)", len(occs),
+                        config.subscription_strikes_per_side,
+                        config.subscription_band_pct)
         except Exception as e:  # noqa: BLE001
             logger.error("Greek cache warm failed: %s", e)
         try:

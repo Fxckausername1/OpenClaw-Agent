@@ -80,6 +80,12 @@ def _is_weekend(day: str) -> bool:
 RECONCILE_INTERVAL_SECONDS = 30.0
 HEALTH_INTERVAL_SECONDS = 60.0
 
+# Fraction of the desired universe that must be subscribed for the stream gate
+# to pass. Not 100%: the candidate universe re-centres on spot, so a routine
+# refresh briefly runs below full coverage. Well above any startup race, which
+# sits near zero. Held contracts are exempt from this tolerance entirely.
+MIN_SUBSCRIPTION_COVERAGE = 0.90
+
 
 class PaperRunner:
     """Assembles the components. Every collaborator is injected so the whole
@@ -114,6 +120,9 @@ class PaperRunner:
         self.full_reconcile = full_reconcile
         self.rebuild_positions = rebuild_positions
         self.last_recon = None
+        # Suppression state for "announce the change, not the condition".
+        self._last_recon_ok = None
+        self._last_degraded_blocking = None
         self.clock = clock
 
         self.readiness = Readiness()
@@ -330,21 +339,38 @@ class PaperRunner:
             connected = bool(s_.is_connected())
             n_sub = int(h.get("n_subscribed", 0) or 0)
             n_desired = int(h.get("n_desired", 0) or 0)
+            pinned_missing = list(h.get("pinned_unsubscribed") or [])
         except Exception as e:  # noqa: BLE001 -- a broken dependency makes the
             # gate RED; it must never take startup down, because the daemon
             # still has to manage any already-open position.
             self.readiness.set("theta_stream_connected", RED, f"stream probe failed: {e!r}")
             return
-        # Require the FULL desired universe, not merely "at least one". A
-        # partial ack is exactly the 0/826 -> 826/826 startup race this gate
-        # is meant to catch.
-        acked = n_desired == 0 or n_sub >= n_desired
-        ok = connected and acked
+        # Demanding 100% ack was right for the startup race this gate was
+        # built for (0/826 -> 826/826) and wrong in steady state: the
+        # candidate universe re-centres on spot as price moves, so a routine
+        # refresh transiently sits below full coverage and was flipping
+        # entries off mid-session for no real reason (observed live:
+        # 300/300 -> 191/300 with the feed perfectly healthy).
+        #
+        # Two claims replace it, and neither weakens the race protection:
+        #   * broad coverage -- a startup race sits near 0%, nowhere near this
+        #   * every HELD contract subscribed, with no tolerance at all, since
+        #     an open position we cannot price is the thing that actually hurts
+        coverage = 1.0 if n_desired == 0 else n_sub / float(n_desired)
+        ok = connected and coverage >= MIN_SUBSCRIPTION_COVERAGE and not pinned_missing
+        if ok:
+            reason = ""
+        elif pinned_missing:
+            reason = f"held contract(s) unsubscribed: {pinned_missing[:3]}"
+        else:
+            reason = (f"connected={connected} subscribed={n_sub}/{n_desired} "
+                      f"({coverage:.0%} < {MIN_SUBSCRIPTION_COVERAGE:.0%} required)")
         self.readiness.set_bool(
-            "theta_stream_connected", ok,
-            "" if ok else f"connected={connected} subscribed={n_sub}/{n_desired}",
+            "theta_stream_connected", ok, reason,
             evidence={"connected": connected, "n_subscribed": n_sub,
-                      "n_desired": n_desired, "generation": h.get("generation")})
+                      "n_desired": n_desired, "coverage": round(coverage, 4),
+                      "pinned_unsubscribed": pinned_missing,
+                      "generation": h.get("generation")})
 
     def _gate_quote_parser(self) -> None:
         """Can ONLY be PASS from a real live message that passed all eleven
@@ -712,7 +738,19 @@ class PaperRunner:
                 self.trade_updates.clear_needs_reconcile()
 
             ok = True if result is None else bool(result.clean)
-            self._publish_critical(ev_kind_reconciliation_result(ok), detail)
+            # ANNOUNCE ONLY WHAT IS NEWS. Reconciliation runs every 30s;
+            # publishing its result unconditionally sent ~120 identical
+            # "nothing changed" messages an hour to Telegram, which buries the
+            # signal notices that actually matter. A clean, unchanged,
+            # periodic pass is a heartbeat, and heartbeats belong on the
+            # dashboard, not in an alert channel.
+            changed = any(detail.get(k) for k in (
+                "adopted", "qty_corrections", "orphans", "orphan_orders",
+                "ambiguous", "resolved_intents"))
+            recovered = ok and self._last_recon_ok is False
+            if (not ok) or changed or recovered or reason != "periodic":
+                self._publish_critical(ev_kind_reconciliation_result(ok), detail)
+            self._last_recon_ok = ok
             return ok
         except Exception as e:  # noqa: BLE001
             logger.exception("reconciliation failed (%s): %s", reason, e)
@@ -745,10 +783,18 @@ class PaperRunner:
                 self.dashboard_sync(snapshot)
             except Exception as e:  # noqa: BLE001 -- dashboard never blocks trading
                 logger.warning("dashboard sync failed (ignored): %s", e)
+        # Same rule: announce the TRANSITION, not the condition. The health
+        # tick fires every 60s, so publishing "still degraded" each time sent
+        # an alert a minute for as long as the market was closed -- and the
+        # blocking set is already on the dashboard continuously.
+        blocking = tuple(self.readiness.blocking())
         if self.readiness.degraded and self.notifier is not None:
-            self._publish_critical("degraded",
-                                   {"reason": reason,
-                                    "blocking": self.readiness.blocking()})
+            if blocking != self._last_degraded_blocking:
+                self._publish_critical("degraded",
+                                       {"reason": reason, "blocking": list(blocking)})
+                self._last_degraded_blocking = blocking
+        elif not self.readiness.degraded:
+            self._last_degraded_blocking = None
 
     def health(self) -> dict:
         return {

@@ -3,6 +3,56 @@ import unittest
 
 import pandas as pd
 
+from smc.theta_market_data import ThetaMarketDataCache
+
+
+class SubscriptionUniverseTests(unittest.TestCase):
+    """Streaming the whole chain saturated the single-core box: 212
+    reconnects, 0/1170 subscriptions acked, nothing tradeable."""
+
+    def _cache(self, spot=580.0, strikes=range(500, 660), **kw):
+        cache = ThetaMarketDataCache(**kw)
+        rows = [{"expiration": __import__("datetime").date(2026, 8, 3),
+                 "strike": float(s), "right": r, "bid": 0.5, "ask": 0.6,
+                 "underlying_price": spot}
+                for s in strikes for r in ("C", "P")]
+        entry = type("E", (), {"book": pd.DataFrame(rows)})()
+        cache._entries = {"e": entry}
+        return cache
+
+    def test_full_chain_is_narrowed_to_the_money(self):
+        full = len(self._cache(subscription_strikes_per_side=0).candidate_occs())
+        narrowed = len(self._cache().candidate_occs())
+        self.assertEqual(full, 320)
+        self.assertLess(narrowed, full)
+        self.assertGreater(narrowed, 0)
+
+    def test_kept_strikes_straddle_spot(self):
+        occs = self._cache().candidate_occs()
+        strikes = sorted({int(o[-8:]) / 1000.0 for o in occs})
+        self.assertLess(min(strikes), 580.0)
+        self.assertGreater(max(strikes), 580.0)
+
+    def test_band_bounds_the_distance_from_spot(self):
+        occs = self._cache(subscription_strikes_per_side=999,
+                           subscription_band_pct=0.01).candidate_occs()
+        strikes = {int(o[-8:]) / 1000.0 for o in occs}
+        self.assertTrue(all(abs(s - 580.0) <= 5.81 for s in strikes), sorted(strikes)[:5])
+
+    def test_fails_open_when_spot_is_unknown(self):
+        """A universe narrowed around an unknown centre could silently
+        exclude the money -- worse than a wide one."""
+        cache = self._cache(spot=float("nan"))
+        for e in cache._entries.values():
+            e.book["underlying_price"] = None
+        self.assertEqual(len(cache.candidate_occs()), 320)
+
+    def test_disabled_returns_the_whole_chain(self):
+        self.assertEqual(
+            len(self._cache(subscription_strikes_per_side=0).candidate_occs()), 320)
+
+import pandas as pd
+
 from smc.theta_market_data import (
     ThetaMarketDataCache, build_occ_symbol, parse_occ_symbol,
 )

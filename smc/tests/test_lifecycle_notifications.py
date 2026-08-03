@@ -436,6 +436,50 @@ class LifecycleChainTests(unittest.TestCase):
             runner_health=self.runner.health(), notifier=Dead())
         self.assertIn("WORKER DOWN", payload["alert_banner"])
 
+    def test_repeated_clean_reconciliation_announces_once_not_every_pass(self):
+        """Reconciliation runs every 30s. Publishing every result put ~120
+        identical 'nothing changed' messages an hour into Telegram, which
+        buries the notices that matter. Observed live: 632 of them in one
+        session."""
+        for _ in range(10):
+            self.runner.reconcile(reason="periodic")
+        recon = [k for k in self._committed() if k == lc.RECONCILIATION_RESULT]
+        self.assertLessEqual(len(recon), 1, f"reconciliation spam: {len(recon)} messages")
+
+    def test_reconciliation_still_announces_a_problem_and_the_recovery(self):
+        """Suppressing the heartbeat must not suppress the alarm."""
+        class Dirty:
+            clean = False
+            degraded = True
+            adopted = qty_corrections = orphans = orphan_orders = []
+            ambiguous = resolved_intents = []
+            halt_reasons = ["UNATTRIBUTED QQQ260803C00580000 qty=1"]
+
+        class Clean(Dirty):
+            clean = True
+            halt_reasons = []
+
+        self.runner.full_reconcile = lambda: Dirty()
+        self.assertFalse(self.runner.reconcile(reason="periodic"))
+        self.assertIn(lc.RECONCILIATION_MISMATCH, self._committed())
+
+        self.runner.full_reconcile = lambda: Clean()
+        self.assertTrue(self.runner.reconcile(reason="periodic"))
+        self.assertIn(lc.RECONCILIATION_RESULT, self._committed())
+
+    def test_degraded_announces_the_transition_not_every_health_tick(self):
+        self.runner.readiness.set_bool("detector_synced", False, "not synced")
+        for _ in range(8):
+            self.runner._publish_state("health")
+        degraded = [k for k, in [(r,) for r in self._committed()] if k == "degraded"]
+        self.assertEqual(len(degraded), 1, f"degraded spam: {len(degraded)} messages")
+
+        # A DIFFERENT blocking set is news again.
+        self.runner.readiness.set_bool("broker_prewarmed", False, "cold")
+        self.runner._publish_state("health")
+        degraded = [k for k in self._committed() if k == "degraded"]
+        self.assertEqual(len(degraded), 2)
+
     def test_exit_trigger_and_exit_submit_are_separate_events(self):
         """A STOP used to announce only `stop_triggered`, so the fact that an
         exit ORDER had gone out was never reported."""
