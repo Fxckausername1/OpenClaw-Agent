@@ -83,6 +83,20 @@ class StartupError(RuntimeError):
     pass
 
 
+def _parse_ts(value):
+    """ISO string -> aware UTC datetime, or None. Never raises: a malformed
+    timestamp must not stop a position from being rebuilt into supervision."""
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
@@ -170,7 +184,9 @@ class Daemon:
             theta_stream=stream, greek_cache=greeks, broker=broker,
             trade_updates=trade_updates, detector=detector,
             terminal_check=(lambda: bool(terminal_manager and terminal_manager.is_ready())),
-            dashboard_sync=self._sync_dashboard)
+            dashboard_sync=self._sync_dashboard,
+            full_reconcile=self._full_reconcile,
+            rebuild_positions=self._rebuild_supervised_positions)
         self.runner.max_quote_age_seconds = config.max_quote_age_seconds
         self.components = {"store": store, "outbox": outbox, "notifier": notifier,
                            "stream": stream, "greeks": greeks, "broker": broker,
@@ -462,6 +478,85 @@ class Daemon:
             return False
         return True
 
+    # ---- reconciliation ---------------------------------------------------
+    def _full_reconcile(self):
+        """Runs the REAL reconciliation (smc/reconcile.py) against broker
+        truth. Returns a ReconResult, or None when it cannot be run at all --
+        the runner treats None as "nothing to judge", and the transport check
+        it does first is what fails the gate when the broker is unreachable.
+
+        The adapter exists because reconcile.py speaks the Broker protocol
+        (parsed orders, BrokerTimeout on ambiguity) while the daemon carries a
+        FastPaperBroker (raw envelopes, never raises). Bridging them is what
+        connects the daemon to reconciliation at all: before this, the module
+        was only reachable from smc/pipeline.py, which the daemon never runs.
+        """
+        from smc.broker_adapter import ReconcileBrokerAdapter
+        from smc.reconcile import reconcile as full_reconcile
+
+        broker = self.components.get("broker")
+        store = self.components.get("store")
+        if broker is None or store is None:
+            return None
+        return full_reconcile(store, ReconcileBrokerAdapter(broker), self.config,
+                              dashboard_db=ROOT / "data" / "options_eval.db")
+
+    def _rebuild_supervised_positions(self) -> int:
+        """Rehydrates the exit monitor's worklist from durable state.
+
+        THE RESTART BUG THIS FIXES: `pipeline.positions` was populated only by
+        a live fill event arriving in THIS process. After a restart holding a
+        position, nothing repopulated it, so `StreamingExitMonitor` iterated an
+        empty list and the position's stop was never evaluated again -- an open
+        position, silently unmanaged, with every readiness gate green.
+
+        Idempotent by construction: keyed on position_id, so repeated
+        reconciliation cycles converge rather than duplicating. Positions that
+        have gone terminal are dropped from supervision here, which is what
+        stops a closed position from being re-exited.
+        """
+        pipeline = self.pipeline
+        store = self.components.get("store")
+        if pipeline is None or store is None:
+            return 0
+        rebuilt = 0
+        live_ids = set()
+        for row in store.open_positions():
+            pid = row["position_id"]
+            live_ids.add(pid)
+            if row["entry_fill_price"] is None or int(row["filled_qty"] or 0) <= 0:
+                # No fill price means nothing to measure a stop against. Leave
+                # it to reconciliation rather than inventing an entry basis.
+                continue
+            existing = pipeline.positions.get(pid)
+            # `opened_at` anchors the time-stop. Prefer the durable fill
+            # timestamp; a restart must not restart the clock, which would
+            # silently extend every time-stop past its intended horizon.
+            opened_at = _parse_ts(row["entry_filled_ts"]) or _parse_ts(row["intent_ts"])
+            pipeline.positions[pid] = {
+                "position_id": pid,
+                "occ": row["occ"],
+                "entry_fill_price": float(row["entry_fill_price"]),
+                "qty": int(row["filled_qty"] or 0),
+                "opened_at": opened_at or (existing or {}).get(
+                    "opened_at", dt.datetime.now(dt.timezone.utc)),
+            }
+            rebuilt += 1
+        for pid in [p for p in pipeline.positions if p not in live_ids]:
+            pipeline.positions.pop(pid, None)
+
+        # A rebuilt position is only "managed" if its quote actually arrives.
+        # Pin the held contracts so the next candidate-universe refresh cannot
+        # unsubscribe them out from under the exit monitor.
+        stream = self.components.get("stream")
+        if stream is not None and hasattr(stream, "set_pinned_occs"):
+            try:
+                stream.set_pinned_occs(
+                    {p["occ"] for p in pipeline.positions.values() if p.get("occ")})
+            except Exception as e:  # noqa: BLE001 -- never block reconciliation
+                logger.error("could not pin held contracts for streaming: %s", e)
+        return rebuilt
+
     def _rest_order_lookup(self, client_order_id):
         b = self.components.get("broker")
         if b is None:
@@ -470,9 +565,27 @@ class Daemon:
         return call.body if getattr(call, "ok", False) else None
 
     def _raise_incident(self, kind, detail):
+        self._notify_lifecycle(kind, detail)
+
+    def _notify_lifecycle(self, kind, detail, **ids) -> None:
+        """The single publish seam for this module.
+
+        Durable-first and non-blocking: the outbox commits before any delivery
+        is attempted, and a notification failure can never propagate into a
+        risk action. `format_message` bounds the body so an over-length
+        message cannot become a permanently-failing event that stalls ordered
+        delivery behind it.
+        """
+        from smc import lifecycle_events as lc
         n = self.components.get("notifier")
-        if n is not None:
-            n.publish(kind, f"{kind}: {detail}", detail=detail)
+        if n is None:
+            return
+        try:
+            n.publish(kind, lc.format_message(kind, detail), detail=detail,
+                      client_order_id=ids.get("client_order_id"),
+                      position_id=ids.get("position_id"))
+        except Exception as e:  # noqa: BLE001 -- never blocks trading
+            logger.warning("notify publish failed (ignored): %s", e)
 
     def _schedule_for(self, now):
         import datetime as _dt
@@ -518,6 +631,19 @@ class Daemon:
         from thetadata_pipeline.selector_policy_experiment import (
             DEFAULT_FEE_PER_CONTRACT, DEFAULT_QUANTITY, DEBIT_CAP_DOLLARS)
 
+        from smc import lifecycle_events as lc
+
+        signal_key = ident.get("signal_key")
+
+        def _reject(reason: str, **extra):
+            """Stage 2, the specific answer. Every one of these paths used to
+            return None silently and surface as one undifferentiated
+            `entry_blocked_or_build_failed`, so 'why did it not trade?' was
+            unanswerable from Telegram."""
+            self._notify_lifecycle(lc.SIGNAL_REJECTED, dict(
+                {"signal_key": signal_key, "reason": reason}, **extra))
+            return None
+
         contract = getattr(selection, "contract", None) or {}
         try:
             expiration = contract["expiration"]
@@ -526,19 +652,22 @@ class Daemon:
             occ = build_occ_symbol("QQQ", expiration, float(contract["strike"]),
                                    contract["right"])
             limit_price = round(float(contract["ask"]), 2)
-        except (KeyError, TypeError, ValueError):
-            return None
+        except (KeyError, TypeError, ValueError) as e:
+            return _reject("contract fields unusable", error=repr(e))
         qty = int(DEFAULT_QUANTITY)
-        if limit_price * 100 * qty + DEFAULT_FEE_PER_CONTRACT * qty > DEBIT_CAP_DOLLARS:
-            return None
+        debit = limit_price * 100 * qty + DEFAULT_FEE_PER_CONTRACT * qty
+        if debit > DEBIT_CAP_DOLLARS:
+            return _reject("debit cap exceeded", occ=occ, debit=round(debit, 2),
+                           cap=DEBIT_CAP_DOLLARS)
 
         now = dt.datetime.now(dt.timezone.utc)
         signal_ts = ident.get("bar_close_utc")
         if not signal_ts or signal_age_seconds(signal_ts, now) > self.config.max_signal_age_seconds:
             self.components["store"].log_event(
                 "SIGNAL_REJECTED_STALE",
-                {"signal_key": ident.get("signal_key"), "signal_ts": signal_ts})
-            return None
+                {"signal_key": signal_key, "signal_ts": signal_ts})
+            return _reject("signal too old", signal_ts=signal_ts,
+                           max_age_seconds=self.config.max_signal_age_seconds)
         now_et = now.astimezone(ZoneInfo("America/New_York"))
         gate = check_entry_allowed(
             self.components["store"], self.components.get("broker"), self.config,
@@ -546,7 +675,8 @@ class Daemon:
             dashboard_db=ROOT / "data" / "options_eval.db",
             now_et=now_et, schedule=self._schedule_for(now))
         if not gate.allowed:
-            return None
+            return _reject("risk gate refused", occ=occ,
+                           gate_reason=getattr(gate, "reason", None))
 
         try:
             intent = self.components["store"].create_entry_intent(
@@ -556,8 +686,20 @@ class Daemon:
                 signal_ts=signal_ts, detected_ts=getattr(sig, "detected_ts", None),
                 selected_ts=now.isoformat(), trigger_kind=getattr(sig, "trigger", None),
                 trigger_score=getattr(sig, "score", None))
-        except (DuplicateSignal, KeyError):
-            return None
+        except DuplicateSignal as e:
+            return _reject("duplicate signal key already has an intent", error=str(e))
+        except KeyError as e:
+            return _reject("signal identity incomplete", error=repr(e))
+
+        # Stage 4. Published AFTER the intent is committed, never before: the
+        # whole point of the commit-then-announce ordering is that we can
+        # never announce an entry that is not durably recorded.
+        self._notify_lifecycle(lc.ENTRY_INTENT_PERSISTED, {
+            "signal_key": signal_key, "position_id": intent["position_id"],
+            "occ": occ, "qty": qty, "limit_price": limit_price,
+            "order_type": "limit"},
+            client_order_id=intent["client_order_id"],
+            position_id=intent["position_id"])
 
         attempt = EntryAttempt(
             client_order_id=intent["client_order_id"], occ=occ,
@@ -575,6 +717,7 @@ class Daemon:
         return attempt
 
     def _submit_entry(self, attempt, selection):
+        from smc import lifecycle_events as lc
         from smc.broker import BrokerRejected, BrokerTimeout
         from smc.entry_manager import REJECTED
         from smc.risk import record_execution_failure
@@ -603,6 +746,16 @@ class Daemon:
         attempt.stage_latency["intent_to_post_start_ms"] = round(
             (time.monotonic() - attempt.submitted_monotonic) * 1000.0, 3)
         store.mark_order_submitted(attempt.client_order_id)
+        # Stage 5, committed BEFORE the POST for the same reason the budget is:
+        # a transport timeout leaves the order's fate unknown, and the one
+        # thing that must not also be unknown is whether we tried. Announcing
+        # after the POST would lose exactly the case that matters most.
+        self._notify_lifecycle(lc.ENTRY_SUBMITTED, {
+            "client_order_id": attempt.client_order_id, "occ": attempt.occ,
+            "qty": attempt.quantity, "limit_price": attempt.limit_price,
+            "position_id": attempt.position_id},
+            client_order_id=attempt.client_order_id,
+            position_id=attempt.position_id)
         t0 = time.monotonic()
         try:
             call = broker.submit_order(payload)
@@ -614,6 +767,11 @@ class Daemon:
             record_execution_failure(store, f"entry rejected: {e}", attempt.position_id)
             attempt.state = REJECTED
             attempt.reject_reason = str(e)
+            self._notify_lifecycle(lc.ORDER_REJECTED, {
+                "client_order_id": attempt.client_order_id, "occ": attempt.occ,
+                "error": str(e), "source": "post_response"},
+                client_order_id=attempt.client_order_id,
+                position_id=attempt.position_id)
             return None
         except BrokerTimeout as e:
             attempt.submit_latency_ms = round((time.monotonic() - t0) * 1000.0, 3)
@@ -635,6 +793,18 @@ class Daemon:
         attempt.broker_order_id = body.get("id")
         if attempt.broker_order_id:
             store.record_broker_ack(attempt.client_order_id, attempt.broker_order_id)
+            # Stage 6, from the POST response. The trade_updates `new` event
+            # publishes the same stage independently; the outbox dedupes on
+            # canonical event id, not on kind, so both are recorded and that
+            # is deliberate -- they are evidence from two different channels
+            # and either one can be the only one that arrives.
+            self._notify_lifecycle(lc.BROKER_ACK, {
+                "client_order_id": attempt.client_order_id,
+                "broker_order_id": attempt.broker_order_id,
+                "status": body.get("status"), "source": "post_response",
+                "broker_post_ms": attempt.submit_latency_ms},
+                client_order_id=attempt.client_order_id,
+                position_id=attempt.position_id)
         return attempt.client_order_id
 
     def _submit_exit(self, position, reason, quote):
@@ -701,7 +871,27 @@ class Daemon:
     def _sync_dashboard(self, runner_health: dict) -> None:
         from smc import dashboard
         pipeline = self.pipeline
+        outbox = self.components.get("outbox")
+        lifecycle = []
+        if outbox is not None:
+            try:
+                lifecycle = outbox.recent_lifecycle()
+            except Exception as e:  # noqa: BLE001 -- panel data never blocks trading
+                logger.warning("lifecycle feed unavailable for dashboard: %s", e)
+        recon = getattr(self.runner, "last_recon", None) if self.runner else None
         payload = dashboard.build_snapshot(
+            lifecycle_events=lifecycle,
+            reconciliation=({
+                "clean": bool(getattr(recon, "clean", False)),
+                "degraded": bool(getattr(recon, "degraded", False)),
+                "adopted": getattr(recon, "adopted", []),
+                "qty_corrections": getattr(recon, "qty_corrections", []),
+                "orphans": getattr(recon, "orphans", []),
+                "orphan_orders": getattr(recon, "orphan_orders", []),
+                "ambiguous": getattr(recon, "ambiguous", []),
+                "resolved_intents": getattr(recon, "resolved_intents", []),
+                "halt_reasons": getattr(recon, "halt_reasons", []),
+            } if recon is not None else None),
             runner_health=runner_health,
             detector=self.components.get("detector"),
             exit_monitor=self.components.get("exit_monitor"),

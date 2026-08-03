@@ -39,6 +39,7 @@ import time
 from typing import Callable, Optional
 
 from smc import events as ev
+from smc import lifecycle_events as lc
 from smc.events import Event, EventBus, make_event
 from smc.readiness import (
     GATES, LIVE_DATA_GATES, MARKET_CLOSED, NOT_TESTABLE, PASS, RED, Readiness,
@@ -46,6 +47,13 @@ from smc.readiness import (
 from smc.singleton import AlreadyRunning, SingleInstance
 
 logger = logging.getLogger("smc.runner")
+
+
+def ev_kind_reconciliation_result(ok: bool) -> str:
+    """Stage 12. A clean pass and a mismatch are both reportable outcomes --
+    previously only the exception path published anything, so a reconciliation
+    that ran and found an orphan was recorded in SQLite and announced nowhere."""
+    return lc.RECONCILIATION_RESULT if ok else lc.RECONCILIATION_MISMATCH
 
 
 
@@ -84,6 +92,8 @@ class PaperRunner:
                  trade_updates=None, detector=None,
                  terminal_check: Optional[Callable] = None,
                  dashboard_sync: Optional[Callable] = None,
+                 full_reconcile: Optional[Callable] = None,
+                 rebuild_positions: Optional[Callable] = None,
                  clock=time.monotonic):
         self.bus = bus or EventBus()
         self.singleton = singleton
@@ -97,6 +107,13 @@ class PaperRunner:
         self.detector = detector
         self.terminal_check = terminal_check
         self.dashboard_sync = dashboard_sync
+        # Injected so the daemon and the tests exercise the SAME reconciliation.
+        # `full_reconcile` runs smc/reconcile.py against broker truth;
+        # `rebuild_positions` rehydrates supervision from durable state. Both
+        # optional only so a unit test can build a bare runner.
+        self.full_reconcile = full_reconcile
+        self.rebuild_positions = rebuild_positions
+        self.last_recon = None
         self.clock = clock
 
         self.readiness = Readiness()
@@ -107,6 +124,10 @@ class PaperRunner:
         self.candidate_ready_count = 0
         self.min_candidates = 1
         self.max_greek_age_seconds = 300.0
+        # How long a critical lifecycle event may sit undelivered before new
+        # entries are blocked. Generous enough to ride out a Telegram blip,
+        # short enough that a whole session cannot run unannounced.
+        self.max_notification_backlog_seconds = 180.0
         self._readiness_lock = threading.RLock()
         self._live_generation = None
         self._fresh_quote_times = {}      # occ -> receipt monotonic
@@ -116,6 +137,10 @@ class PaperRunner:
         self.market_closed = False
         self.universe_rows = 0
         self.attempts: dict = {}          # client_order_id -> EntryAttempt
+        # Set by assembly.build_pipeline. When true, the pipeline owns the
+        # lifecycle announcements and this runner suppresses its own
+        # duplicates of them.
+        self.pipeline_attached = False
         self._stop = threading.Event()
         self._handlers = {
             ev.EV_QUOTE: self._on_quote,
@@ -150,6 +175,7 @@ class PaperRunner:
         operating state, not a crash."""
         self._gate_singleton()
         self._gate_state()
+        self._gate_notifications()
         self._gate_terminal()
         self._gate_stream()
         self._gate_quote_parser()
@@ -242,6 +268,39 @@ class PaperRunner:
                                     "" if ok else "state store or outbox missing")
         except Exception as e:  # noqa: BLE001
             self.readiness.set("state_recovered", RED, repr(e))
+
+    def _gate_notifications(self) -> None:
+        """Can the lifecycle actually be announced right now?
+
+        Blocks NEW entries only. An open position keeps being managed and the
+        daemon keeps running -- the failure mode this prevents is trading
+        into silence, not trading at all. Self-heals: the periodic health tick
+        re-runs this, so a breaker that closes after its cooldown or a worker
+        that comes back reopens the gate with no manual action.
+        """
+        n = self.notifier
+        if n is None:
+            self.readiness.set("notifications_operational", RED,
+                               "no notifier: lifecycle events cannot be delivered")
+            return
+        probe = getattr(n, "operational", None)
+        if not callable(probe):
+            # Fail closed rather than assume. A notifier that cannot report
+            # its own delivery health cannot be trusted to have delivered
+            # anything, and "no evidence" must not read as "healthy".
+            self.readiness.set(
+                "notifications_operational", RED,
+                f"{type(n).__name__} does not report delivery health")
+            return
+        try:
+            ok, reason, evidence = probe(
+                max_backlog_seconds=self.max_notification_backlog_seconds)
+        except Exception as e:  # noqa: BLE001 -- a probe must never kill startup
+            self.readiness.set("notifications_operational", RED,
+                               f"notification probe failed: {e!r}")
+            return
+        self.readiness.set_bool("notifications_operational", ok, reason,
+                                evidence=evidence)
 
     def _gate_terminal(self) -> None:
         """MDDS+FPSS login only. Says nothing about the WebSocket."""
@@ -479,13 +538,20 @@ class PaperRunner:
             reason=payload.get("reason", ""))
         if attempt.terminal:
             self.bus.cancel_scheduled(f"ttl-{attempt.client_order_id}")
+            if self.pipeline_attached:
+                # The assembled pipeline chains to this handler and then
+                # publishes the richer, position-aware version of the same
+                # fact. Publishing here too sent every fill to Telegram
+                # TWICE. The state work above still runs; only the duplicate
+                # announcement is suppressed.
+                return
             if attempt.has_position:
                 # Includes FILLED_AFTER_CANCEL_REQUEST: a late fill is a real
                 # position and must be managed, never discarded.
-                self._publish_critical("order_fill", attempt.summary(),
+                self._publish_critical(lc.ORDER_FILL, attempt.summary(),
                                        client_order_id=attempt.client_order_id)
             else:
-                self._publish_critical("order_terminal", attempt.summary(),
+                self._publish_critical(lc.ORDER_TERMINAL, attempt.summary(),
                                        client_order_id=attempt.client_order_id)
 
     def _on_signal(self, event: Event) -> None:
@@ -543,6 +609,7 @@ class PaperRunner:
         the singleton or reopening state. Safe to call repeatedly."""
         was_permitted = self.readiness.entries_permitted
         try:
+            self._gate_notifications()
             self._gate_terminal()
             self._gate_stream()
             self._gate_quote_parser()
@@ -588,22 +655,69 @@ class PaperRunner:
                                 "client_order_id": attempt.client_order_id}))
 
     def reconcile(self, reason: str = "periodic") -> bool:
-        """REST truth vs local state. Returns success; a failure degrades
-        readiness rather than raising."""
+        """Broker truth vs local state, then rebuild supervision.
+
+        This used to check only that `open_orders()` and `positions()` came
+        back `ok` and return True -- so the `reconciled` gate went green on
+        "the broker answered", having adopted nothing. A restart holding a
+        position passed the gate with an empty supervision set and the
+        position went unmanaged. Three things now have to happen, in order,
+        before entries may be permitted:
+
+            1. the transport answers at all
+            2. smc/reconcile.py runs and comes back clean (no orphan, no
+               ambiguous ownership, no unresolved intent, no halt)
+            3. every durably-open position is rebuilt into supervision
+
+        Order matters between 2 and 3: reconciliation is what corrects
+        quantities and finalises unresolved intents, so rebuilding first would
+        hand the exit monitor a position the broker has already closed.
+
+        Returns success; a failure degrades readiness rather than raising, so
+        an open position keeps being managed while entries stay blocked.
+        """
         if self.broker is None or self.state is None:
             return False
+        detail = {"reason": reason}
         try:
             orders = self.broker.open_orders()
             positions = self.broker.positions()
             if not (getattr(orders, "ok", False) and getattr(positions, "ok", False)):
+                detail["error"] = (
+                    f"broker transport not ok (orders={getattr(orders, 'status', None)}, "
+                    f"positions={getattr(positions, 'status', None)})")
+                self._publish_critical(ev_kind_reconciliation_result(False), detail)
                 return False
+
+            result = None
+            if self.full_reconcile is not None:
+                result = self.full_reconcile()
+                self.last_recon = result
+                detail.update({
+                    "clean": bool(getattr(result, "clean", False)),
+                    "degraded": bool(getattr(result, "degraded", False)),
+                    "adopted": len(getattr(result, "adopted", []) or []),
+                    "qty_corrections": len(getattr(result, "qty_corrections", []) or []),
+                    "orphans": len(getattr(result, "orphans", []) or []),
+                    "orphan_orders": len(getattr(result, "orphan_orders", []) or []),
+                    "ambiguous": len(getattr(result, "ambiguous", []) or []),
+                    "resolved_intents": len(getattr(result, "resolved_intents", []) or []),
+                    "halt_reasons": list(getattr(result, "halt_reasons", []) or [])[:5],
+                })
+
+            if self.rebuild_positions is not None:
+                detail["supervised_positions"] = self.rebuild_positions()
+
             if self.trade_updates is not None:
                 self.trade_updates.clear_needs_reconcile()
-            return True
+
+            ok = True if result is None else bool(result.clean)
+            self._publish_critical(ev_kind_reconciliation_result(ok), detail)
+            return ok
         except Exception as e:  # noqa: BLE001
             logger.exception("reconciliation failed (%s): %s", reason, e)
-            self._publish_critical("reconciliation_mismatch",
-                                   {"reason": reason, "error": repr(e)})
+            detail["error"] = repr(e)
+            self._publish_critical("reconciliation_mismatch", detail)
             return False
 
     def _publish_critical(self, kind: str, detail: dict, **ids) -> None:
@@ -620,7 +734,9 @@ class PaperRunner:
 
     @staticmethod
     def _format(kind: str, detail: dict) -> str:
-        return f"{kind}: {detail}"
+        # Bounded: an over-length body is a permanent Telegram 400, and under
+        # ordered delivery a permanently-failing event stalls the chain.
+        return lc.format_message(kind, detail)
 
     def _publish_state(self, reason: str) -> None:
         snapshot = self.health()

@@ -41,6 +41,7 @@ from typing import Optional
 from smc import notify
 from smc.notify_outbox import (
     STATE_ABANDONED, STATE_DELIVERED, STATE_FAILED, STATE_PENDING, NotifyOutbox,
+    is_ordered,
 )
 
 logger = logging.getLogger("smc.notify_queue")
@@ -95,6 +96,9 @@ class NotifyQueue:
         self._suppressed = 0
         self._hint_deferred = 0     # queue was full; row remains durable+pending
         self._coalesced = 0
+        self._order_stalls = 0      # batches cut short to preserve chain order
+        self._worker_passes = 0
+        self._worker_db_path: Optional[str] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
@@ -168,7 +172,17 @@ class NotifyQueue:
     def drain_once(self, outbox: NotifyOutbox, limit: int = 25) -> int:
         """Attempts pending obligations, most urgent first. Returns delivered
         count. Honors the breaker: when OPEN nothing is attempted and rows
-        simply stay pending."""
+        simply stay pending.
+
+        ORDERING. A failed lifecycle event STOPS the batch rather than letting
+        its successors overtake it. Without this, one transient failure on
+        `entry_submitted` followed by a success on `order_fill` would deliver
+        the fill before the submission -- an out-of-order chain, which is
+        exactly what heff asked to be prevented. The cost is head-of-line
+        blocking; that is the intended trade, and it is made visible by
+        `undelivered_critical` and by the `notifications_operational`
+        readiness gate rather than being absorbed silently.
+        """
         with self._lock:
             if self._state_locked() == STATE_OPEN:
                 self._suppressed += 1
@@ -187,15 +201,52 @@ class NotifyQueue:
                 outbox.mark_delivered(row["event_id"])
                 self._record_success()
                 delivered += 1
-            else:
-                outbox.mark_failed(row["event_id"], err)
-                self._record_failure()
+                continue
+            new_state = outbox.mark_failed(row["event_id"], err)
+            self._record_failure()
+            if is_ordered(row["kind"]) and new_state != STATE_ABANDONED:
+                # Still owed, and everything after it must wait its turn.
+                with self._lock:
+                    self._order_stalls += 1
+                break
         return delivered
 
     # -------------------------------------------------------------- worker
+    def _resolve_db_path(self) -> Optional[str]:
+        """Find the publisher's database file so the worker can open its OWN
+        connection to it.
+
+        Without this, a NotifyQueue built with no explicit `db_path` fell back
+        to sharing the publisher's connection, and sqlite3 refuses a
+        cross-thread handle -- so every worker pass raised, was swallowed by
+        the never-die guard, and delivered nothing. The thread stayed alive
+        the whole time, which is precisely the false-green the
+        `notifications_operational` gate must not accept: alive is not the
+        same as working. Resolved on the CALLER's thread, in start().
+        """
+        if self._db_path is not None:
+            return str(self._db_path)
+        try:
+            for row in self._outbox.conn.execute("PRAGMA database_list"):
+                if row[1] == "main" and row[2]:
+                    return str(row[2])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("could not resolve outbox database path: %s", e)
+        return None
+
     def start(self) -> None:
         if self._thread is not None:
             return
+        resolved = self._resolve_db_path()
+        if resolved is None:
+            # An in-memory or unresolvable database. Refuse to start rather
+            # than run a thread that can only throw: a worker that cannot
+            # deliver must look DOWN to the readiness gate, not up.
+            logger.error("notify worker not started: no resolvable database path; "
+                         "obligations remain durable but nothing will be delivered")
+            self._worker_db_path = None
+            return
+        self._worker_db_path = resolved
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="smc-notify", daemon=True)
         self._thread.start()
@@ -206,9 +257,20 @@ class NotifyQueue:
             self._thread.join(timeout=timeout)
         self._thread = None
 
+    def worker_alive(self) -> bool:
+        """Whether the drain thread is actually running. A publisher can keep
+        committing durable rows forever with a dead worker, so 'the outbox
+        accepted it' is NOT evidence that anything will be delivered -- the
+        readiness gate needs this separately."""
+        t = self._thread
+        return bool(t is not None and t.is_alive())
+
     def _run(self) -> None:
-        conn = _connect(self._db_path) if self._db_path else None
-        outbox = NotifyOutbox(conn) if conn is not None else self._outbox
+        # The worker owns its OWN connection. Never the publisher's: sqlite3
+        # refuses a cross-thread handle, and sharing one silently disabled
+        # delivery while leaving the thread alive.
+        conn = _connect(self._worker_db_path)
+        outbox = NotifyOutbox(conn)
         last_sweep = 0.0
         try:
             while not self._stop.is_set():
@@ -224,6 +286,8 @@ class NotifyQueue:
                         self.drain_once(outbox)
                     except Exception as e:  # noqa: BLE001 -- worker must never die
                         logger.exception("notify worker pass failed: %s", e)
+                    with self._lock:
+                        self._worker_passes += 1
         finally:
             if conn is not None:
                 conn.close()
@@ -239,13 +303,46 @@ class NotifyQueue:
                 "suppressed": self._suppressed,
                 "hint_deferred": self._hint_deferred,
                 "coalesced": self._coalesced,
+                "order_stalls": self._order_stalls,
+                "worker_passes": self._worker_passes,
                 "consecutive_failures": self._consecutive_failures,
             }
+        base["worker_alive"] = self.worker_alive()
         try:
             base["outbox"] = self._outbox.counts()
             base["undelivered_critical"] = len(self._outbox.undelivered_critical())
+            base["oldest_undelivered_critical_seconds"] = (
+                self._outbox.oldest_undelivered_critical_age_seconds())
+            base["outbox_readable"] = True
         except sqlite3.Error:
             base["outbox"] = None
             base["undelivered_critical"] = None
+            base["oldest_undelivered_critical_seconds"] = None
+            base["outbox_readable"] = False
         base["direct_transport"] = notify.direct_health()
         return base
+
+    def operational(self, max_backlog_seconds: float = 180.0) -> tuple:
+        """(ok, reason, evidence) -- can this pipeline be trusted to announce
+        a fill right now?
+
+        Deliberately answers a DELIVERY question, not a queue-depth one. A
+        deep backlog during a burst is fine; a backlog that is OLD, a dead
+        worker, an unreadable ledger, or an open breaker all mean the next
+        critical event would go unannounced, and entries must not proceed
+        into that silence. None of these stop an existing position from being
+        managed -- this only gates NEW entries.
+        """
+        h = self.health()
+        if not h.get("worker_alive"):
+            return False, "notification worker thread is not running", h
+        if not h.get("outbox_readable", False):
+            return False, "durable outbox is not readable", h
+        if h.get("state") == STATE_OPEN:
+            return False, ("telegram circuit breaker OPEN after "
+                           f"{h.get('consecutive_failures')} consecutive failures"), h
+        age = h.get("oldest_undelivered_critical_seconds")
+        if age is not None and age > float(max_backlog_seconds):
+            return False, (f"oldest undelivered critical event is {age:.0f}s old "
+                           f"(ceiling {max_backlog_seconds:.0f}s)"), h
+        return True, "", h

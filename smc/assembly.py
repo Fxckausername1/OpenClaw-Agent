@@ -35,6 +35,7 @@ import logging
 from typing import Callable, Optional
 
 from smc import events as ev
+from smc import lifecycle_events as lc
 from smc.events import make_event
 from smc.signal_identity import make_signal_identity
 
@@ -120,31 +121,39 @@ def build_pipeline(*, runner, detector_worker=None, exit_monitor=None,
                               else "shadow_no_order",
         }
         p.signals_seen.append(signal_view)
-        _notify("signal_detected", signal_view)
+        _notify(lc.SIGNAL_DETECTED, signal_view)
 
         # Mode is an independent, first gate. A readiness bug can never
         # make validate or paper-connectivity submit an order.
         if not execution_enabled:
-            _notify("signal_blocked_mode", {"signal_key": ident.get("signal_key")})
+            _notify(lc.SIGNAL_BLOCKED_MODE, {"signal_key": ident.get("signal_key")})
             return
 
         # Dedup on the stable identity: a repeat can never place a 2nd order.
         if ident.get("signal_key") in p.entries:
-            _notify("signal_duplicate_suppressed", {"signal_key": ident.get("signal_key")})
+            _notify(lc.SIGNAL_DUPLICATE_SUPPRESSED,
+                    {"signal_key": ident.get("signal_key")})
             return
 
         if not runner.readiness.entries_permitted:
-            _notify("signal_blocked", {"signal_key": ident.get("signal_key"),
-                                       "blocking": runner.readiness.blocking()})
+            _notify(lc.SIGNAL_BLOCKED, {"signal_key": ident.get("signal_key"),
+                                        "blocking": runner.readiness.blocking()})
             return
 
         # SWEEP_RECLAIM is excluded UPSTREAM, before any book is built.
         from smc.selector_variant_b import is_trigger_eligible
         trigger = getattr(sig, "trigger", ident.get("trigger"))
         if not is_trigger_eligible(trigger):
-            _notify("signal_excluded_sweep_reclaim",
+            _notify(lc.SIGNAL_EXCLUDED_SWEEP_RECLAIM,
                     {"signal_key": ident.get("signal_key"), "trigger": trigger})
             return
+
+        # Stage 2, the accept side. Every rejection path above announces
+        # itself; without this one the chain has a decision point that is
+        # only ever reported when the answer is no.
+        _notify(lc.SIGNAL_ACCEPTED,
+                {"signal_key": ident.get("signal_key"), "trigger": trigger,
+                 "side": signal_view["side"], "score": signal_view["score"]})
 
         universe_started = clock()
         book = build_universe(sig) if build_universe else None
@@ -153,16 +162,33 @@ def build_pipeline(*, runner, detector_worker=None, exit_monitor=None,
         selection = select_contract(book, sig) if select_contract else None
         selection_ms = (clock() - selection_started) * 1000.0
         if selection is None or not getattr(selection, "found", False):
-            _notify("no_eligible_contract",
+            _notify(lc.NO_ELIGIBLE_CONTRACT,
                     {"signal_key": ident.get("signal_key"),
                      "reason": getattr(selection, "reason", "no selection")})
             return
+
+        # Stage 3.
+        contract = getattr(selection, "contract", None) or {}
+        _notify(lc.CONTRACT_SELECTED, {
+            "signal_key": ident.get("signal_key"),
+            "strike": contract.get("strike"), "right": contract.get("right"),
+            "expiration": str(contract.get("expiration")),
+            "bid": contract.get("bid"), "ask": contract.get("ask"),
+            "delta": contract.get("delta"),
+            "spread_pct_mid": contract.get("spread_pct_mid"),
+            "selection_ms": round(selection_ms, 3),
+        })
 
         entry_started = clock()
         attempt = entry_builder(sig, selection, ident) if entry_builder else None
         entry_build_ms = (clock() - entry_started) * 1000.0
         if attempt is None:
-            _notify("entry_blocked_or_build_failed",
+            # entry_builder announces the SPECIFIC reason (stale signal, debit
+            # cap, risk gate, duplicate intent) as a signal_rejected before it
+            # returns None. This stays as the catch-all for a builder that
+            # failed without attributing a cause, so the chain still records a
+            # terminal decision either way.
+            _notify(lc.ENTRY_BLOCKED_OR_BUILD_FAILED,
                     {"signal_key": ident.get("signal_key")})
             return
         attempt.stage_latency.update({
@@ -180,10 +206,14 @@ def build_pipeline(*, runner, detector_worker=None, exit_monitor=None,
             if submitted is None and attempt.broker_order_id:
                 submitted = attempt.client_order_id
         if not submitted:
-            _notify("order_submit_failed_or_unknown", attempt.summary(),
+            _notify(lc.ORDER_SUBMIT_FAILED_OR_UNKNOWN, attempt.summary(),
                     client_order_id=attempt.client_order_id)
             return
-        _notify("order_submitted", attempt.summary(),
+        # Stages 4-6 (intent persisted, entry submitted, broker ack) are
+        # emitted by the entry builder and submitter themselves, at the exact
+        # moment each fact becomes true. This is the post-return confirmation
+        # that the whole submit path completed.
+        _notify(lc.ORDER_SUBMITTED, attempt.summary(),
                 client_order_id=attempt.client_order_id)
 
     runner._handlers[ev.EV_SIGNAL] = handle_signal
@@ -202,9 +232,22 @@ def build_pipeline(*, runner, detector_worker=None, exit_monitor=None,
                         position_id=rec.position_id, occ=rec.occ,
                         client_order_id=rec.client_order_id,
                         intended_qty=pos.get("qty", 1))
-                _notify("stop_triggered" if rec.reason == "STOP" else
-                        "target_triggered" if rec.reason == "TARGET" else "exit_submitted",
-                        dataclasses.asdict(rec), position_id=rec.position_id)
+                detail = dataclasses.asdict(rec)
+                # TRIGGER and SUBMIT are two different facts and are now two
+                # events. Previously one message covered both, and it chose
+                # its kind by reason -- so a STOP exit announced
+                # "stop_triggered" and NEVER announced that an order had gone
+                # out, while a submission that failed still announced the
+                # trigger as though it had. The pair now always fires in
+                # order, and the submit event carries whether it landed.
+                _notify(lc.STOP_TRIGGERED if rec.reason == "STOP" else
+                        lc.TARGET_TRIGGERED if rec.reason == "TARGET" else
+                        lc.EXIT_TRIGGER,
+                        detail, position_id=rec.position_id)
+                _notify(lc.EXIT_SUBMITTED if rec.submitted
+                        else lc.EXIT_NOT_SUBMITTED,
+                        detail, position_id=rec.position_id,
+                        client_order_id=rec.client_order_id)
                 return rec
         return None
 
@@ -248,9 +291,23 @@ def build_pipeline(*, runner, detector_worker=None, exit_monitor=None,
                     store.record_order_terminal(coid, CANCELED, "trade_updates canceled")
                 elif kind in ("rejected", "expired"):
                     store.record_order_terminal(coid, REJECTED, payload.get("reason", kind))
+            if kind == "partial_fill":
+                _notify(lc.ORDER_PARTIAL_FILL, a.as_dict() if a is not None else
+                        {"client_order_id": coid, "role": "exit"},
+                        position_id=getattr(a, "position_id", None),
+                        client_order_id=coid)
             if a is not None and a.terminal:
                 if exit_monitor is not None:
                     exit_monitor.on_exit_terminal(a.position_id)
+                if a.state != "FILLED":
+                    # An exit that ended without filling leaves the position
+                    # OPEN and unprotected. Announcing only the fill case made
+                    # that the one outcome nobody would hear about.
+                    _notify(lc.ORDER_CANCELED if kind == "canceled"
+                            else lc.ORDER_REJECTED if kind in ("rejected", "expired")
+                            else lc.ORDER_TERMINAL,
+                            a.as_dict(), position_id=a.position_id,
+                            client_order_id=coid)
                 if a.state == "FILLED":
                     pos = p.positions.pop(a.position_id, None)
                     if (store is not None and pos is not None and price is not None
@@ -289,6 +346,17 @@ def build_pipeline(*, runner, detector_worker=None, exit_monitor=None,
                 if attempt.filled_qty <= 0:
                     store.set_position_state(pid, REJECTED, payload.get("reason", kind))
 
+        if attempt is not None and kind == "new":
+            # Stage 6 from the broker's own event stream. `_submit_entry`
+            # announces the ack it read from the POST response; this is the
+            # independent confirmation that the venue accepted the order, and
+            # it is the only ack that exists at all when the POST response
+            # was lost.
+            _notify(lc.BROKER_ACK,
+                    {"client_order_id": coid, "broker_order_id": event.order_id,
+                     "source": "trade_updates"},
+                    client_order_id=coid, position_id=pid)
+
         if (attempt is not None and attempt.filled_qty > 0
                 and attempt.fill_price is not None):
             pid = pid or f"pos-{coid}"
@@ -299,10 +367,18 @@ def build_pipeline(*, runner, detector_worker=None, exit_monitor=None,
                 "entry_fill_price": attempt.fill_price,
                 "qty": attempt.filled_qty,
                 "opened_at": opened}
-            _notify("order_fill", attempt.summary(), client_order_id=coid,
-                    position_id=pid)
+            # Partial and full are different facts: a partial leaves an
+            # unfilled remainder working. They were both reported as
+            # `order_fill`, which made a half fill indistinguishable from a
+            # complete one in Telegram.
+            fully = kind == "fill" or attempt.filled_qty >= attempt.quantity
+            _notify(lc.ORDER_FILL if fully else lc.ORDER_PARTIAL_FILL,
+                    attempt.summary(), client_order_id=coid, position_id=pid)
         elif attempt is not None and attempt.state == "REJECTED":
-            _notify("order_rejected", attempt.summary(), client_order_id=coid)
+            _notify(lc.ORDER_REJECTED, attempt.summary(), client_order_id=coid)
+        elif attempt is not None and kind == "canceled":
+            _notify(lc.ORDER_CANCELED, attempt.summary(), client_order_id=coid,
+                    position_id=pid)
 
     for etype in (ev.EV_FILL, ev.EV_PARTIAL_FILL, ev.EV_CANCEL,
                   ev.EV_REJECT, ev.EV_ORDER_ACK):
@@ -313,13 +389,19 @@ def build_pipeline(*, runner, detector_worker=None, exit_monitor=None,
         if notifier is None:
             return
         try:
-            notifier.publish(kind, f"{kind}: {detail}", detail=detail,
+            # format_message bounds the body. An unbounded f-string here could
+            # produce a message Telegram permanently refuses for length, and
+            # under ordered delivery one permanent failure stalls the chain.
+            notifier.publish(kind, lc.format_message(kind, detail), detail=detail,
                              client_order_id=ids.get("client_order_id"),
                              position_id=ids.get("position_id"))
         except Exception as e:  # noqa: BLE001 -- never blocks trading
             logger.warning("notify failed (ignored): %s", e)
 
     p._notify = _notify
+    # Tells the runner that this pipeline now owns lifecycle announcements, so
+    # it stops publishing its own duplicate of every fill.
+    runner.pipeline_attached = True
     if exit_monitor is not None:
         exit_monitor.open_positions = lambda: list(p.positions.values())
     return p

@@ -120,6 +120,7 @@ class ThetaStreamClient:
         self._lock = threading.RLock()
         self._cache: dict = {}          # occ -> StreamQuote
         self._desired: set = set()      # occ set the caller wants subscribed
+        self._pinned: set = set()       # held contracts; never dropped by a refresh
         self._subscribed: set = set()   # occ set actually confirmed by Terminal
         self._connected = False
         self._last_message_monotonic: Optional[float] = None
@@ -181,9 +182,31 @@ class ThetaStreamClient:
         refresh) sets the FULL desired set. The background loop diffs
         against what's actually subscribed and sends only the incremental
         add/remove requests -- never a full unsubscribe/resubscribe unless
-        reconnecting."""
+        reconnecting.
+
+        Pinned contracts are unioned in and cannot be removed by a universe
+        refresh -- see set_pinned_occs."""
         with self._lock:
-            self._desired = set(occs)
+            self._desired = set(occs) | self._pinned
+
+    def set_pinned_occs(self, occs: set) -> None:
+        """Contracts that must stay subscribed regardless of the candidate
+        universe: the ones we actually HOLD.
+
+        A held contract is not necessarily a candidate. The next session's
+        candidate set is built from fresh Greeks and can easily exclude
+        yesterday's strike, and `set_desired_universe` replaces the whole set
+        -- so the periodic refresh would unsubscribe the one quote the exit
+        monitor needs to evaluate a stop. Pinning is what stops an open
+        position from going quote-blind after a routine universe refresh.
+        """
+        with self._lock:
+            self._pinned = set(occs)
+            self._desired |= self._pinned
+
+    def pinned_occs(self) -> set:
+        with self._lock:
+            return set(self._pinned)
 
     # -------------------------------------------------------------- reading
     def get_quote(self, occ: str) -> Optional[StreamQuote]:
@@ -275,6 +298,8 @@ class ThetaStreamClient:
                 "connected": self._connected,
                 "n_cached_quotes": len(self._cache),
                 "n_desired": len(self._desired),
+                "n_pinned": len(self._pinned),
+                "pinned_unsubscribed": sorted(self._pinned - self._subscribed),
                 "n_subscribed": len(self._subscribed),
                 "generation": self._generation,
                 "reconnect_count": self._reconnect_count,

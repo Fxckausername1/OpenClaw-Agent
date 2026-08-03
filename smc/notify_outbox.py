@@ -34,6 +34,8 @@ import logging
 import sqlite3
 from typing import Optional
 
+from smc import lifecycle_events as lc
+
 logger = logging.getLogger("smc.notify_outbox")
 
 STATE_PENDING = "pending"
@@ -44,16 +46,20 @@ STATE_ABANDONED = "abandoned"
 DEFAULT_MAX_ATTEMPTS = 8
 
 # Priority: LOWER is more urgent. Drained in this order.
-PRIORITY_CRITICAL = 0
-PRIORITY_LIFECYCLE = 1
+#
+# Every trade-lifecycle kind shares PRIORITY_ORDERED, which is what makes
+# delivery order equal commit order within the chain: with priority tied, the
+# secondary sort is event_id. Splitting the chain across two priorities is
+# precisely what used to deliver a fill ahead of the signal that caused it.
+PRIORITY_ORDERED = 0
+PRIORITY_CRITICAL = PRIORITY_ORDERED     # retained name; same rank
+PRIORITY_LIFECYCLE = 1                   # incidents and other non-chain events
 PRIORITY_INFO = 5
 
-# Event kinds that must never be dropped, coalesced or abandoned.
-CRITICAL_KINDS = frozenset({
-    "order_submitted", "order_rejected", "order_partial_fill", "order_fill",
-    "stop_triggered", "target_triggered", "exit_submitted", "exit_filled",
-    "reconciliation_mismatch",
-})
+# Ordered, never coalesced: the whole chain (smc/lifecycle_events.py).
+ORDERED_KINDS = lc.LIFECYCLE_KINDS
+# Additionally retried forever and never abandoned: the money-touching subset.
+CRITICAL_KINDS = lc.CRITICAL_KINDS
 # Kinds that may be coalesced when they pile up.
 COALESCIBLE_KINDS = frozenset({"health", "heartbeat", "stream_status", "cache_status"})
 
@@ -91,12 +97,24 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def classify(kind: str) -> tuple:
-    """(priority, critical) for an event kind."""
+    """(priority, critical) for an event kind.
+
+    Note that ORDERED and CRITICAL are separate claims. Every chain event is
+    ordered (priority 0); only the money-touching ones are also critical
+    (retry forever, never abandon). See smc/lifecycle_events.py.
+    """
+    if kind in ORDERED_KINDS:
+        return PRIORITY_ORDERED, (1 if kind in CRITICAL_KINDS else 0)
     if kind in CRITICAL_KINDS:
-        return PRIORITY_CRITICAL, 1
+        return PRIORITY_ORDERED, 1
     if kind in COALESCIBLE_KINDS:
         return PRIORITY_INFO, 0
     return PRIORITY_LIFECYCLE, 0
+
+
+def is_ordered(kind: str) -> bool:
+    """True when this kind participates in strict commit-order delivery."""
+    return kind in ORDERED_KINDS
 
 
 class NotifyOutbox:
@@ -214,6 +232,53 @@ class NotifyOutbox:
                 "GROUP BY delivery_state"):
             out[row["delivery_state"]] = row["c"]
         return out
+
+    def recent_lifecycle(self, limit: int = 40) -> list:
+        """Newest-first view of the trade chain for the dashboard, with each
+        event's stage number and DELIVERY state.
+
+        Delivery state is the point. A dashboard that showed only that an
+        event happened would look identical whether or not anyone was ever
+        told about it -- which is the exact condition this work exists to
+        make visible.
+        """
+        rows = self.conn.execute(
+            "SELECT event_id, created_ts, kind, critical, delivery_state, "
+            "       attempts, last_error, delivered_ts "
+            "FROM smc_notifications WHERE kind IN (%s) "
+            "ORDER BY event_id DESC LIMIT ?" % ",".join("?" * len(ORDERED_KINDS)),
+            (*sorted(ORDERED_KINDS), limit)).fetchall()
+        return [{
+            "event_id": r["event_id"],
+            "stage": lc.stage_of(r["kind"]),
+            "kind": r["kind"],
+            "critical": bool(r["critical"]),
+            "created_ts": r["created_ts"],
+            "delivery_state": r["delivery_state"],
+            "attempts": r["attempts"],
+            "delivered_ts": r["delivered_ts"],
+            "last_error": r["last_error"],
+        } for r in rows]
+
+    def oldest_undelivered_critical_age_seconds(self, now=None) -> Optional[float]:
+        """Age of the OLDEST outstanding critical obligation, or None when
+        there is none. This is the number the readiness gate acts on: a
+        backlog that is merely deep may just be a burst, but a backlog that
+        is OLD means delivery is not working."""
+        row = self.conn.execute(
+            "SELECT MIN(created_ts) AS oldest FROM smc_notifications "
+            "WHERE critical=1 AND delivery_state IN (?,?)",
+            (STATE_PENDING, STATE_FAILED)).fetchone()
+        if row is None or not row["oldest"]:
+            return None
+        try:
+            created = dt.datetime.fromisoformat(row["oldest"])
+        except (TypeError, ValueError):
+            return None
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=dt.timezone.utc)
+        now = now or dt.datetime.now(dt.timezone.utc)
+        return max((now - created).total_seconds(), 0.0)
 
     def undelivered_critical(self) -> list:
         """Outstanding critical obligations -- surfaced on the dashboard so an

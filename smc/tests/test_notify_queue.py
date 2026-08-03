@@ -201,6 +201,11 @@ class BreakerTests(_Base):
     def test_breaker_opens_and_leaves_rows_pending_not_lost(self):
         nq = self.q(sender=lambda m, c: False, failure_threshold=2)
         eids = [nq.publish("order_fill", f"m{i}") for i in range(4)]
+        # Two passes, not one: ordered delivery now stops a batch at the first
+        # failure so a later event cannot overtake an earlier one, which means
+        # one drain makes exactly one attempt. The invariant this test exists
+        # for -- nothing is lost or abandoned -- is unchanged.
+        nq.drain_once(self.outbox)
         nq.drain_once(self.outbox)
         self.assertEqual(nq.state(), STATE_OPEN)
         states = {self.outbox.get(e)["delivery_state"] for e in eids}

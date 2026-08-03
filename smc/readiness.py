@@ -37,6 +37,14 @@ THE THETADATA SPLIT, and why each gate is separate:
                                   inside ceiling, valid expirations only
     candidate_universe_ready      enough contracts have BOTH a fresh stream
                                   quote and a fresh Greek
+
+NOTIFICATIONS ARE A TRADING PRECONDITION, not a convenience. An entry whose
+fill, stop and exit cannot be announced is an entry nobody can supervise, so
+`notifications_operational` blocks NEW entries whenever the notify worker is
+dead, the durable outbox is unreadable, the Telegram breaker is open, or a
+critical obligation has been undelivered past its ceiling. It does NOT stop
+the daemon and does NOT stop an existing position from being managed: the
+gate exists so the system waits loudly instead of trading silently.
 """
 from __future__ import annotations
 
@@ -57,6 +65,7 @@ NON_BLOCKING_EXPLANATIONS = frozenset({MARKET_CLOSED, NOT_TESTABLE, SKIPPED})
 GATES = (
     "singleton",
     "state_recovered",
+    "notifications_operational",
     "theta_terminal_authenticated",
     "theta_stream_connected",
     "theta_quote_parser_verified",

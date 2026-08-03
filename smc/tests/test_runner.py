@@ -80,12 +80,20 @@ class FakeState:
 
 
 class FakeNotifier:
-    def __init__(self):
+    def __init__(self, operational=True, reason=""):
         self.published = []
+        self._operational = operational
+        self._reason = reason
 
     def publish(self, kind, message, detail=None, **kw):
         self.published.append((kind, message))
         return len(self.published)
+
+    def operational(self, max_backlog_seconds=180.0):
+        """Real notifiers must be able to report whether delivery works; the
+        `notifications_operational` gate fails closed against one that
+        cannot. The double implements it for the same reason."""
+        return self._operational, self._reason, {"fake": True}
 
     def health(self):
         return {"state": "closed"}

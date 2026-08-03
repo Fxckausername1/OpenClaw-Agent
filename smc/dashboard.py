@@ -37,7 +37,8 @@ SCHEMA = "smc-dashboard-v1"
 def build_snapshot(*, runner_health: dict, detector=None, exit_monitor=None,
                    exit_liveness=None, notifier=None, positions=None,
                    recent_signals=None, recent_orders=None,
-                   entry_attempts=None) -> dict:
+                   entry_attempts=None, lifecycle_events=None,
+                   reconciliation=None) -> dict:
     """Assembles the panel payload. Pure -- no I/O, so it is safe to call
     from anywhere and trivially testable."""
     readiness = (runner_health or {}).get("readiness", {}) or {}
@@ -154,8 +155,19 @@ def build_snapshot(*, runner_health: dict, detector=None, exit_monitor=None,
             "failed": notif.get("failed"),
             "outbox": notif.get("outbox"),
             "undelivered_critical": notif.get("undelivered_critical"),
+            "oldest_undelivered_critical_seconds": notif.get(
+                "oldest_undelivered_critical_seconds"),
             "hint_deferred": notif.get("hint_deferred"),
+            "worker_alive": notif.get("worker_alive"),
+            "outbox_readable": notif.get("outbox_readable"),
+            "order_stalls": notif.get("order_stalls"),
         },
+
+        # --- the lifecycle chain, with whether anyone was actually told ---
+        "lifecycle_events": (lifecycle_events or [])[:40],
+        "lifecycle_undelivered": [e for e in (lifecycle_events or [])
+                                  if e.get("delivery_state") in ("pending", "failed")][:20],
+        "reconciliation": reconciliation,
 
         # --- the two states that must never be subtle ---
         "unmanaged_risk_count": unmanaged,
@@ -168,6 +180,9 @@ def _banner(readiness: dict, unmanaged: int, notif: dict) -> Optional[str]:
     if unmanaged:
         return (f"UNMANAGED RISK: {unmanaged} position(s) with unresolved exit "
                 "fate. NOT confirmed closed. Manual attribution required.")
+    if notif and notif.get("worker_alive") is False:
+        return ("NOTIFICATION WORKER DOWN -- lifecycle events are being recorded "
+                "durably but nothing is being delivered. New entries are blocked.")
     if int(notif.get("undelivered_critical") or 0):
         return (f"{notif['undelivered_critical']} critical notification(s) "
                 "undelivered -- trading unaffected, but you are not being told.")

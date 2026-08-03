@@ -19,7 +19,26 @@ from pathlib import Path
 
 from smc import run_daemon as rd
 
+# `options_orchestrator` reads credentials/alpaca_key.txt at IMPORT time and
+# raises if it is absent -- a deliberate fail-fast: no credentials must mean
+# no trading path, not a half-initialised one. That makes this graph test
+# environment-dependent, because a clean checkout has no credentials/ (it is
+# gitignored, and must stay that way).
+#
+# Skipping is the honest resolution. The alternatives are worse: softening the
+# credential read would weaken a real safety property in live code, and
+# committing placeholder secrets to satisfy a test invites exactly the
+# confusion between real and fake credentials that this branch exists to
+# avoid. On the box, where credentials are present, this suite runs in full.
+_CREDENTIALS = Path(rd.ROOT) / "credentials"
+_HAVE_CREDENTIALS = ((_CREDENTIALS / "alpaca_key.txt").exists()
+                     and (_CREDENTIALS / "alpaca_secret.txt").exists())
 
+
+@unittest.skipUnless(
+    _HAVE_CREDENTIALS,
+    "requires credentials/alpaca_key.txt and alpaca_secret.txt; "
+    "options_orchestrator reads them at import time and fails closed without them")
 class ProductionGraphTests(unittest.TestCase):
     """Runs offline-validate, which opens no socket but builds the full
     graph -- the point being that the graph is mode-independent."""
