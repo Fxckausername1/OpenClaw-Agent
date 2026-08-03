@@ -117,7 +117,13 @@ class DashboardTests(unittest.TestCase):
     def test_undelivered_critical_surfaces(self):
         class N:
             def health(self):
-                return {"undelivered_critical": 3, "state": "open"}
+                # The banner now alarms on how LONG an obligation has been
+                # outstanding, not merely that one exists: every publish is
+                # briefly undelivered, so a count-based banner stayed lit
+                # through any active session.
+                return {"undelivered_critical": 3, "state": "open",
+                        "worker_alive": True, "outbox_readable": True,
+                        "oldest_undelivered_critical_seconds": 600.0}
         r = Readiness()
         for g in GATES:
             r.set_bool(g, True)

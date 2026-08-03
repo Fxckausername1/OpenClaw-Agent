@@ -33,6 +33,12 @@ CANDIDATE = "VARIANT_B_NO_SWEEP"
 SIGNAL_FEED = "alpaca_iex"
 SCHEMA = "smc-dashboard-v1"
 
+# How long a critical notification may sit undelivered before the banner calls
+# it out. Matches PaperRunner.max_notification_backlog_seconds, so the panel
+# raises the alarm at the same moment the readiness gate blocks new entries
+# rather than at some unrelated threshold of its own.
+UNDELIVERED_ALARM_SECONDS = 180.0
+
 
 def build_snapshot(*, runner_health: dict, detector=None, exit_monitor=None,
                    exit_liveness=None, notifier=None, positions=None,
@@ -183,9 +189,16 @@ def _banner(readiness: dict, unmanaged: int, notif: dict) -> Optional[str]:
     if notif and notif.get("worker_alive") is False:
         return ("NOTIFICATION WORKER DOWN -- lifecycle events are being recorded "
                 "durably but nothing is being delivered. New entries are blocked.")
-    if int(notif.get("undelivered_critical") or 0):
-        return (f"{notif['undelivered_critical']} critical notification(s) "
-                "undelivered -- trading unaffected, but you are not being told.")
+    # Alarm on AGE, not on count. Every publish is briefly undelivered by
+    # construction -- the row is committed before the worker is even hinted --
+    # so a count-based banner lit up for a freshly-published event that was 11
+    # milliseconds old, and would have stayed lit through any active session.
+    # A banner that is always on is a banner nobody reads. What actually
+    # matters is an obligation that is not CLEARING.
+    if float(notif.get("oldest_undelivered_critical_seconds") or 0.0) > UNDELIVERED_ALARM_SECONDS:
+        return (f"{notif.get('undelivered_critical')} critical notification(s) "
+                f"undelivered for over {UNDELIVERED_ALARM_SECONDS:.0f}s -- trading "
+                "unaffected, but you are not being told.")
     if readiness.get("degraded", True):
         return f"DEGRADED -- entries blocked by: {readiness.get('blocking', [])}"
     return None

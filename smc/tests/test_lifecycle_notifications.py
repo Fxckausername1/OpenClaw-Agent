@@ -396,6 +396,46 @@ class LifecycleChainTests(unittest.TestCase):
             lifecycle_events=self.outbox.recent_lifecycle())
         self.assertEqual(payload2["lifecycle_undelivered"], [])
 
+    def test_banner_ignores_a_freshly_published_event_but_alarms_on_a_stuck_one(self):
+        """Every publish is undelivered for a moment by construction -- the
+        durable row is committed before the worker is even hinted. A banner
+        that fires on the COUNT is therefore lit permanently during any active
+        session, which is the same as having no banner at all."""
+        from smc import dashboard
+
+        class Notif:
+            """Stubbed because the subject is the banner rule, not the queue."""
+
+            def __init__(self, age):
+                self.age = age
+
+            def health(self):
+                return {"state": "closed", "worker_alive": True,
+                        "outbox_readable": True, "undelivered_critical": 1,
+                        "oldest_undelivered_critical_seconds": self.age}
+
+        green = self.runner.health()
+        fresh = dashboard.build_snapshot(runner_health=green, notifier=Notif(0.011))
+        self.assertIsNone(fresh["alert_banner"])
+
+        stuck = dashboard.build_snapshot(
+            runner_health=green,
+            notifier=Notif(dashboard.UNDELIVERED_ALARM_SECONDS + 60))
+        self.assertIsNotNone(stuck["alert_banner"])
+        self.assertIn("undelivered", stuck["alert_banner"])
+
+    def test_banner_calls_out_a_dead_notification_worker(self):
+        from smc import dashboard
+
+        class Dead:
+            def health(self):
+                return {"state": "closed", "worker_alive": False,
+                        "outbox_readable": True, "undelivered_critical": 0}
+
+        payload = dashboard.build_snapshot(
+            runner_health=self.runner.health(), notifier=Dead())
+        self.assertIn("WORKER DOWN", payload["alert_banner"])
+
     def test_exit_trigger_and_exit_submit_are_separate_events(self):
         """A STOP used to announce only `stop_triggered`, so the fact that an
         exit ORDER had gone out was never reported."""
