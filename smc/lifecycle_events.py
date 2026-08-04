@@ -211,15 +211,140 @@ def is_critical(kind: str) -> bool:
     return kind in CRITICAL_KINDS
 
 
-def format_message(kind: str, detail) -> str:
-    """Human-readable, and bounded.
+def _et(ts) -> str:
+    """UTC ISO timestamp -> HH:MM ET. heff reads the market in ET; a UTC
+    string in an alert is one more thing to convert in your head."""
+    if not ts:
+        return ""
+    try:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+        parsed = _dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+        return parsed.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
+    except (ImportError, TypeError, ValueError):
+        return str(ts)[11:19]
 
-    Truncation is a delivery-safety requirement, not cosmetics: an
+
+def _money(value) -> str:
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _get(detail, *keys):
+    """First present key, or None. Details are built by several call sites and
+    do not all use the same field names."""
+    if not isinstance(detail, dict):
+        return None
+    for key in keys:
+        if detail.get(key) is not None:
+            return detail[key]
+    return None
+
+
+def _summarize(kind: str, detail) -> str:
+    """A line a human can read on a phone.
+
+    The dict repr this replaced was accurate and unreadable: an alert nobody
+    can parse at a glance is not an alert, and heff correctly reported the
+    messages as looking "like code".
+    """
+    if not isinstance(detail, dict):
+        return str(detail)
+
+    side = _get(detail, "side", "signal_side")
+    trigger = _get(detail, "trigger", "trigger_kind")
+    score = _get(detail, "score", "trigger_score")
+    price = _get(detail, "price")
+    occ = _get(detail, "occ", "symbol")
+    qty = _get(detail, "qty", "quantity", "filled_qty", "intended_qty")
+    reason = _get(detail, "reason", "exit_reason", "gate_reason")
+
+    stage = STAGE_OF.get(kind)
+
+    if stage == 1 or kind == SIGNAL_ACCEPTED:
+        bits = ["QQQ", str(side or "").upper(), str(trigger or "")]
+        if score is not None:
+            bits.append(f"score {score}")
+        if price is not None:
+            bits.append(_money(price))
+        bits.append(_et(_get(detail, "bar_close_utc", "detected_ts")))
+        return " | ".join(b for b in bits if b)
+
+    if stage == 2:            # a rejection
+        why = reason or kind.replace("signal_", "").replace("_", " ")
+        extra = _get(detail, "blocking", "error", "cap", "debit")
+        return f"no trade -- {why}" + (f" ({extra})" if extra else "")
+
+    if stage == 3:
+        if kind == NO_ELIGIBLE_CONTRACT:
+            return f"no contract passed the filters -- {reason or 'no selection'}"
+        strike, right = _get(detail, "strike"), _get(detail, "right")
+        bid, ask = _get(detail, "bid"), _get(detail, "ask")
+        delta = _get(detail, "delta")
+        return (f"QQQ {strike}{right} exp {_get(detail, 'expiration')} | "
+                f"bid {bid} ask {ask}" + (f" | delta {delta}" if delta else ""))
+
+    if stage in (4, 5, 6):
+        limit = _get(detail, "limit_price")
+        what = {4: "intent saved", 5: "order sent", 6: "broker accepted"}[stage]
+        return (f"{what} | {occ or 'QQQ'} x{qty or 1}"
+                + (f" @ {_money(limit)}" if limit else ""))
+
+    if stage == 7:
+        px = _get(detail, "fill_price", "price", "avg_fill_price")
+        word = "PARTIAL FILL" if kind == ORDER_PARTIAL_FILL else "FILLED"
+        return f"{word} | {occ or 'QQQ'} x{qty or 1}" + (f" @ {_money(px)}" if px else "")
+
+    if stage == 8:
+        return f"order {kind.replace('order_', '')} | {occ or 'QQQ'}" + (
+            f" -- {reason}" if reason else "")
+
+    if stage in (9, 10, 11):
+        px = _get(detail, "quote_bid", "fill_price", "price")
+        word = {9: f"EXIT TRIGGER ({reason or kind})",
+                10: "exit order sent" if kind == EXIT_SUBMITTED
+                    else "EXIT DID NOT GO OUT",
+                11: "EXIT FILLED"}[stage]
+        entry = _get(detail, "entry_fill_price")
+        out = f"{word} | {occ or 'QQQ'}"
+        if px:
+            out += f" @ {_money(px)}"
+        if entry:
+            out += f" (entry {_money(entry)})"
+        return out
+
+    if stage == 12:
+        if kind == RECONCILIATION_MISMATCH:
+            halts = _get(detail, "halt_reasons") or _get(detail, "error")
+            return f"BROKER MISMATCH -- entries halted: {halts}"
+        changed = [f"{k}={detail[k]}" for k in
+                   ("adopted", "qty_corrections", "orphans", "resolved_intents")
+                   if detail.get(k)]
+        return "broker and local records agree" + (
+            f" (after: {', '.join(changed)})" if changed else "")
+
+    return str(detail)
+
+
+def format_message(kind: str, detail) -> str:
+    """`kind: human summary`, bounded.
+
+    The kind stays as a leading token -- it is a useful label and the tests
+    key off it -- but the body is now a sentence rather than a Python dict
+    repr. Truncation is a delivery-safety requirement, not cosmetics: an
     over-length message is a permanent Telegram 400, and under ordered
     delivery one permanent failure stalls everything behind it.
     """
-    body = f"{kind}: {detail}"
+    try:
+        summary = _summarize(kind, detail)
+    except Exception:  # noqa: BLE001 -- never let formatting break an alert
+        summary = str(detail)
+    body = f"{kind}: {summary}"
     if len(body) <= MAX_MESSAGE_CHARS:
         return body
     keep = MAX_MESSAGE_CHARS - len(kind) - 40
-    return f"{kind}: {str(detail)[:max(keep, 0)]}... [truncated]"
+    return f"{kind}: {summary[:max(keep, 0)]}... [truncated]"
