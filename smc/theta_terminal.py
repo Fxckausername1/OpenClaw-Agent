@@ -45,6 +45,7 @@ class ThetaTerminalManager:
         port: int = 25520,
         startup_timeout: float = 90.0,
         watchdog_interval: float = 2.0,
+        allow_spawn: bool = True,
         popen: Callable = subprocess.Popen,
         run: Callable = subprocess.run,
         port_check: Optional[Callable[[], bool]] = None,
@@ -68,6 +69,10 @@ class ThetaTerminalManager:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._watchdog: Optional[threading.Thread] = None
+        # When False this manager may WAIT for a Terminal but never start
+        # one. Set by the daemon whenever theta-terminal.service owns the
+        # lifecycle, so a startup race cannot produce two Terminals.
+        self.allow_spawn = allow_spawn
         self._process = None
         self._owned = False
         self._state = "stopped"
@@ -145,9 +150,45 @@ class ThetaTerminalManager:
             pass
         logger.info("Theta Terminal launched pid=%s", process.pid)
 
+    def _wait_for_external(self, timeout: float) -> bool:
+        """Give an externally-managed Terminal time to finish binding.
+
+        THE DUPLICATE-TERMINAL BUG. systemd starts theta-terminal.service and
+        smc-paper-daemon.service at the same instant. The daemon won the race,
+        found the port not yet listening, and spawned a SECOND Terminal of its
+        own -- observed live on 2026-08-03 as two independent JVM pairs, the
+        systemd one at 262MB and the daemon's duplicate at 712MB. On a 1.9GB
+        box that duplicate is what forced the machine into swap, and swap
+        stalls are what timed out the market-data keepalive. A one-shot port
+        check at startup is simply not enough to conclude nobody else is
+        starting one.
+        """
+        deadline = self._clock() + timeout
+        while self._clock() < deadline and not self._stop.is_set():
+            if self._port_check():
+                return True
+            self._sleep(0.25)
+        return bool(self._port_check())
+
     def ensure_running(self, *, wait: bool = True) -> bool:
         if self.is_ready():
             return True
+        if not self.allow_spawn:
+            # Someone else owns the Terminal's lifecycle. Wait for it; never
+            # start a competing copy.
+            ready = self._wait_for_external(self.startup_timeout)
+            with self._lock:
+                if ready:
+                    self._state = "ready_external"
+                    self._last_error = None
+                else:
+                    self._state = "down"
+                    self._last_error = (
+                        f"externally-managed Terminal not listening on "
+                        f"{self.host}:{self.port}; refusing to spawn a duplicate")
+            if not ready:
+                logger.error("%s", self._last_error)
+            return ready
         with self._lock:
             if not self._owned_alive():
                 if self._process is not None:
@@ -182,6 +223,8 @@ class ThetaTerminalManager:
         while not self._stop.wait(self.watchdog_interval):
             if self.is_ready():
                 continue
+            if not self.allow_spawn:
+                continue          # external owner; never respawn
             if not self._owned_alive():
                 self.ensure_running(wait=False)
 

@@ -83,6 +83,28 @@ class StartupError(RuntimeError):
     pass
 
 
+def _systemd_owns_theta_terminal(unit: str = "theta-terminal.service") -> bool:
+    """True when systemd is managing the Terminal, so this daemon must not.
+
+    Deliberately treats "enabled but not yet active" as owned: at boot both
+    units start together and the Terminal is still binding, which is exactly
+    the window in which the daemon used to spawn a duplicate. Any error is
+    treated as NOT owned, preserving the standalone behaviour for anyone
+    running the daemon without the unit installed.
+    """
+    import subprocess
+    for verb in ("is-active", "is-enabled"):
+        try:
+            result = subprocess.run(["systemctl", verb, unit],
+                                    capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        state = (result.stdout or "").strip()
+        if state in ("active", "activating", "enabled", "enabled-runtime", "static"):
+            return True
+    return False
+
+
 def _parse_ts(value):
     """ISO string -> aware UTC datetime, or None. Never raises: a malformed
     timestamp must not stop a position from being rebuilt into supervision."""
@@ -235,7 +257,17 @@ class Daemon:
         stream = greeks = broker = trade_updates = None
         try:
             from smc.theta_terminal import ThetaTerminalManager
-            terminal_manager = ThetaTerminalManager()
+            # If theta-terminal.service owns the Terminal, WAIT for it -- never
+            # start a second one. Both units are started by systemd at the same
+            # instant, and the daemon used to win that race, find the port not
+            # yet listening, and spawn its own duplicate: two JVM pairs, 712MB
+            # of them untracked by systemd, on a 1.9GB box. That duplication is
+            # what pushed the machine into swap and killed the market feed.
+            externally_managed = _systemd_owns_theta_terminal()
+            terminal_manager = ThetaTerminalManager(allow_spawn=not externally_managed)
+            logger.info("Theta Terminal lifecycle: %s",
+                        "theta-terminal.service (waiting, will not spawn)"
+                        if externally_managed else "owned by this daemon")
             terminal_manager.start()
         except Exception as e:  # noqa: BLE001
             logger.error("Theta Terminal manager start failed: %s", e)

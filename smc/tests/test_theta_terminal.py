@@ -2,6 +2,76 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+
+from smc.theta_terminal import ThetaTerminalManager
+
+
+class NoDuplicateTerminalTests(unittest.TestCase):
+    """systemd starts theta-terminal.service and smc-paper-daemon.service at
+    the same instant. The daemon won that race, saw the port not yet listening
+    and started its OWN Terminal -- two JVM pairs, the duplicate 712MB and
+    invisible to systemd, on a 1.9GB box. That is what forced the machine into
+    swap and killed the market-data feed."""
+
+    def _manager(self, ready_after_calls, **kw):
+        calls = {"n": 0}
+
+        def port_check():
+            calls["n"] += 1
+            return calls["n"] > ready_after_calls
+
+        spawned = []
+        m = ThetaTerminalManager(
+            port_check=port_check,
+            popen=lambda *a, **k: spawned.append(a) or self.fail("spawned!"),
+            clock=lambda: calls["n"] * 0.25,
+            sleep=lambda s: None, startup_timeout=30.0, **kw)
+        return m, spawned
+
+    def test_waits_for_an_external_terminal_instead_of_spawning(self):
+        m, spawned = self._manager(ready_after_calls=5, allow_spawn=False)
+        self.assertTrue(m.ensure_running(wait=True))
+        self.assertEqual(spawned, [])
+        self.assertEqual(m.health()["state"], "ready_external")
+
+    def test_refuses_to_spawn_even_if_the_external_one_never_appears(self):
+        """Fail loudly rather than quietly duplicating. A missing feed blocks
+        entries; a duplicate Terminal takes the whole box down."""
+        m = ThetaTerminalManager(
+            port_check=lambda: False, allow_spawn=False,
+            popen=lambda *a, **k: self.fail("spawned a duplicate Terminal"),
+            clock=lambda: 1e9, sleep=lambda s: None, startup_timeout=0.0)
+        self.assertFalse(m.ensure_running(wait=True))
+        self.assertIn("refusing to spawn", m.health()["last_error"])
+
+    def test_watchdog_never_respawns_when_externally_managed(self):
+        m = ThetaTerminalManager(
+            port_check=lambda: False, allow_spawn=False,
+            popen=lambda *a, **k: self.fail("watchdog spawned a duplicate"),
+            clock=lambda: 1e9, sleep=lambda s: None, startup_timeout=0.0)
+        m._stop.set()
+        m._watch()          # returns immediately; must not have spawned
+
+    def test_standalone_mode_still_spawns(self):
+        """Without the systemd unit installed the daemon must still work."""
+        spawned = []
+
+        class P:
+            def poll(self):
+                return None
+            pid = 4242
+
+        m = ThetaTerminalManager(
+            port_check=lambda: False, allow_spawn=True,
+            popen=lambda *a, **k: (spawned.append(a), P())[1],
+            run=lambda *a, **k: type("R", (), {
+                "returncode": 0, "stdout": 'version "21.0.1"', "stderr": ""})(),
+            clock=lambda: 1e9, sleep=lambda s: None, startup_timeout=0.0)
+        m.java_path = __import__("pathlib").Path(__file__)   # exists
+        m.jar_path = __import__("pathlib").Path(__file__)
+        m.key_file = __import__("pathlib").Path(__file__)
+        m.ensure_running(wait=False)
+        self.assertEqual(len(spawned), 1)
 from pathlib import Path
 from types import SimpleNamespace
 
